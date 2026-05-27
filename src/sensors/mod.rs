@@ -1742,7 +1742,7 @@ mod tests {
     fn it_should_return_each_disk_with_its_associated_metadata() {
         let number_of_disks_from_sysinfo = sysinfo::Disks::new_with_refreshed_list().len();
         let mut topology = generate_mock_topology();
-        let disks = topology.get_disks_temp();
+        let disks = topology.get_disks();
 
         assert_eq!(disks.len(), number_of_disks_from_sysinfo);
     }
