@@ -1,6 +1,6 @@
 use crate::exporters::Exporter;
 use crate::sensors::Topology;
-use crate::sensors::{utils::ProcessRecord, Sensor};
+use crate::sensors::{Sensor, utils::ProcessRecord};
 use std::{fs, io, thread, time};
 
 /// An Exporter that extracts power consumption data of running
@@ -92,7 +92,7 @@ impl QemuExporter {
                             }
                             Err(err) => {
                                 error!(
-                                    "Could'nt edit {}. Please check file permissions : {}",
+                                    "Couldn't edit {}. Please check file permissions : {}",
                                     complete_path, err
                                 );
                             }
