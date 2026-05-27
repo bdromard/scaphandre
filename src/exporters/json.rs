@@ -140,6 +140,14 @@ struct Disk {
     disk_available_bytes: String,
     disk_name: String,
 }
+
+#[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+#[derive(Debug, Deserialize, Serialize)]
+struct EvaluatedDisk {
+    disk_name: String,
+    timestamp: f64,
+    consumption: u32,
+}
 #[derive(Serialize, Deserialize)]
 struct Components {
     disks: Option<Vec<Disk>>,
@@ -155,6 +163,8 @@ struct Report {
     host: Host,
     consumers: Vec<Consumer>,
     sockets: Vec<Socket>,
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    evaluated_disks: Vec<EvaluatedDisk>,
 }
 
 impl Exporter for JsonExporter {
@@ -344,6 +354,32 @@ impl JsonExporter {
             }
         }
         res
+    }
+
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    fn generate_evaluated_disks_report(&mut self, metrics: &[Metric]) -> Vec<EvaluatedDisk> {
+        let disks_metrics: Vec<&Metric> = metrics
+            .iter()
+            .filter(|metric| metric.name == "scaph_disk_power_microwatts")
+            .collect();
+
+        let mut evaluated_disk_metrics: Vec<EvaluatedDisk> = disks_metrics
+            .iter()
+            .map(|metric| {
+                let disk_name = metric.attributes.get("disk_name").unwrap().to_string();
+
+                let consumption = metric.metric_value.to_string().parse::<f64>().unwrap() as u32;
+                let timestamp = metric.timestamp.as_secs_f64();
+
+                EvaluatedDisk {
+                    disk_name,
+                    consumption,
+                    timestamp,
+                }
+            })
+            .collect();
+        evaluated_disk_metrics.sort_by(|a, b| a.disk_name.cmp(&b.disk_name));
+        evaluated_disk_metrics
     }
 
     fn iterate(&mut self) {
@@ -558,10 +594,14 @@ impl JsonExporter {
 
         match host_report {
             Some(host) => {
+                #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+                let evaluated_disks = self.generate_evaluated_disks_report(&metrics);
                 let report = Report {
                     host,
                     consumers: top_consumers,
                     sockets: all_sockets,
+                    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+                    evaluated_disks,
                 };
 
                 // Serialize the report to json
@@ -577,35 +617,134 @@ impl JsonExporter {
             }
             None => {
                 info!("No data yet, didn't write report.");
-                let report = Report {
-                    host: Host {
-                        timestamp: current_system_time_since_epoch().as_secs_f64(),
-                        consumption: 0.0,
-                        components: Components {
-                            disks: Some(vec![]),
-                        },
-                    },
-                    consumers: vec![],
-                    sockets: vec![],
-                };
-                serde_json::to_writer(&mut self.out_writer, &report)
-                    .expect("report should be serializable to JSON");
-                let res = self.out_writer.flush();
-                match res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Couldn't flush out_writer: {}", e);
-                    }
-                }
             }
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(target_os = "linux", feature = "disks_evaluation", test))]
 mod tests {
-    //#[test]
-    //fn get_cons_socket0() {}
+    use super::*;
+    use crate::sensors::{
+        disk::{EvaluatedDisk, DiskKindWrapper, DiskPowerSpecs, DiskState, FormFactor},
+        units::Unit,
+        utils::ProcessTracker,
+        Record, Sensor, Topology,
+    };
+    use std::error::Error;
+
+    struct MockSensor;
+    impl Sensor for MockSensor {
+        fn get_topology(&self) -> Box<Option<Topology>> {
+            Box::new(Some(self.generate_topology().unwrap()))
+        }
+        fn generate_topology(&self) -> Result<Topology, Box<dyn Error>> {
+            let mock_topology = generate_mock_topology();
+            Ok(mock_topology)
+        }
+    }
+
+    fn generate_mock_topology() -> Topology {
+        let mut mock_sensor_data = HashMap::new();
+        mock_sensor_data.insert(String::from("key"), String::from("value"));
+        let proc_tracker = ProcessTracker::new(5);
+
+        let power_specs = DiskPowerSpecs {
+            name: String::from("Disk name"),
+            manufacturer: String::from("Disk manufacturer"),
+            kind: DiskKindWrapper::SSD,
+            capacity: 1024,
+            form_factor: FormFactor::NVME,
+            idle: 0.5,
+            read: 3.0,
+            write: 5.0,
+            read_write: None,
+            read_bytes: 0,
+            written_bytes: 0,
+        };
+
+        let two_seconds = Duration::new(2, 0);
+        let four_seconds = Duration::new(4, 0);
+
+        let first_record = Record {
+            timestamp: two_seconds,
+            value: String::from("5000000.0"),
+            unit: Unit::MicroWatt,
+        };
+
+        let second_record = Record {
+            timestamp: four_seconds,
+            value: String::from("8000000.0"),
+            unit: Unit::MicroWatt,
+        };
+
+        let first_disk = EvaluatedDisk {
+            name: String::from("nvme0n1"),
+            form_factor: FormFactor::NVME,
+            kind: DiskKindWrapper::SSD,
+            capacity: 1024,
+            max_buffer_size: 1,
+            record_buffer: vec![first_record.clone(), second_record.clone()],
+            power_specs: Some(power_specs.clone()),
+            state: DiskState::Unknown,
+            power_model: None,
+        };
+
+        let second_disk = EvaluatedDisk {
+            name: String::from("nvme0n2"),
+            form_factor: FormFactor::NVME,
+            kind: DiskKindWrapper::SSD,
+            capacity: 1024,
+            max_buffer_size: 1,
+            record_buffer: vec![first_record, second_record],
+            power_specs: Some(power_specs),
+            state: DiskState::Unknown,
+            power_model: None,
+        };
+
+        Topology {
+            sockets: vec![],
+            stat_buffer: vec![],
+            record_buffer: vec![],
+            buffer_max_kbytes: 1,
+            domains_names: None,
+            _sensor_data: mock_sensor_data,
+            proc_tracker,
+            disks: vec![first_disk, second_disk],
+        }
+    }
+
+    fn generate_mock_exporter() -> JsonExporter {
+        let mock_sensor = MockSensor {};
+        let args = ExporterArgs {
+            timeout: None,
+            step: 2,
+            step_nano: 0,
+            max_top_consumers: 5,
+            file: None,
+            containers: false,
+            process_regex: None,
+            container_regex: None,
+            resources: false,
+        };
+
+        JsonExporter::new(&mock_sensor, args)
+    }
+
+    #[test]
+    fn it_should_export_all_evaluated_disks() {
+        let mut mock_json_exporter = generate_mock_exporter();
+        mock_json_exporter.metric_generator.generate_disk_metrics();
+        let metrics = mock_json_exporter.metric_generator.pop_metrics();
+
+        let evaluated_disks_report = mock_json_exporter.generate_evaluated_disks_report(&metrics);
+
+        assert_eq!(evaluated_disks_report.len(), 2);
+        assert_eq!(evaluated_disks_report[0].disk_name, String::from("nvme0n1"));
+        assert_eq!(evaluated_disks_report[1].disk_name, String::from("nvme0n2"));
+        assert_eq!(evaluated_disks_report[0].consumption, 8000000);
+        assert_eq!(evaluated_disks_report[1].consumption, 8000000);
+    }
 }
 
 //  Copyright 2020 The scaphandre authors.

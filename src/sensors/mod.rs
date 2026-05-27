@@ -7,6 +7,10 @@
 pub mod msr_rapl;
 #[cfg(target_os = "windows")]
 use msr_rapl::get_msr_value;
+#[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+pub mod disk;
+#[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+use disk::{format_disk_name, generate_power_model, EvaluatedDisk};
 #[cfg(target_os = "linux")]
 pub mod powercap_rapl;
 pub mod units;
@@ -15,9 +19,10 @@ pub mod utils;
 use procfs::{CpuInfo, CpuTime, KernelStats};
 use std::{collections::HashMap, error::Error, fmt, fs, mem::size_of_val, str, time::Duration};
 #[allow(unused_imports)]
-use sysinfo::{CpuExt, Pid, System, SystemExt};
-use sysinfo::{DiskExt, DiskType};
-use utils::{IProcess, ProcessTracker, current_system_time_since_epoch};
+use sysinfo::{DiskKind, Pid, System};
+use utils::{current_system_time_since_epoch, IProcess, ProcessTracker};
+
+use crate::sensors::disk::{Attributes, DiskMetrics, Metric, Metrics};
 
 // !!!!!!!!!!!!!!!!! Sensor !!!!!!!!!!!!!!!!!!!!!!!
 /// Sensor trait, the Sensor API.
@@ -59,6 +64,10 @@ pub struct Topology {
     pub domains_names: Option<Vec<String>>,
     /// Sensor-specific data needed in the topology
     pub _sensor_data: HashMap<String, String>,
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    /// Disks with their power consumption evaluated
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    pub disks: Vec<EvaluatedDisk>,
 }
 
 impl RecordGenerator for Topology {
@@ -146,6 +155,8 @@ impl Topology {
             buffer_max_kbytes: 1,
             domains_names: None,
             _sensor_data: sensor_data,
+            #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+            disks: vec![],
         }
     }
 
@@ -359,6 +370,12 @@ impl Topology {
         self.refresh_procs();
         self.refresh_record();
         self.refresh_stats();
+
+        #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+        {
+            let disks = sysinfo::Disks::new_with_refreshed_list();
+            self.refresh_disks(&disks);
+        }
     }
 
     /// Gets currently running processes (as procfs::Process instances) and stores
@@ -366,7 +383,8 @@ impl Topology {
     fn refresh_procs(&mut self) {
         {
             let pt = &mut self.proc_tracker;
-            pt.sysinfo.refresh_processes();
+            pt.sysinfo
+                .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let current_procs = pt
                 .sysinfo
                 .processes()
@@ -618,7 +636,7 @@ impl Topology {
     }
 
     pub fn get_load_avg(&self) -> Option<Vec<Record>> {
-        let load = self.get_proc_tracker().sysinfo.load_average();
+        let load = sysinfo::System::load_average();
         let timestamp = current_system_time_since_epoch();
         Some(vec![
             Record::new(timestamp, load.one.to_string(), units::Unit::Numeric),
@@ -627,57 +645,115 @@ impl Topology {
         ])
     }
 
-    pub fn get_disks(&self) -> HashMap<String, (String, HashMap<String, String>, Record)> {
+    pub fn get_disks(&mut self) -> Vec<DiskMetrics> {
         let timestamp = current_system_time_since_epoch();
-        let mut res = HashMap::new();
-        for d in self.proc_tracker.sysinfo.disks() {
-            let mut attributes = HashMap::new();
-            if let Ok(file_system) = str::from_utf8(d.file_system()) {
-                attributes.insert(String::from("disk_file_system"), String::from(file_system));
-            }
-            if let Some(mount_point) = d.mount_point().to_str() {
-                attributes.insert(String::from("disk_mount_point"), String::from(mount_point));
-            }
-            match d.type_() {
-                DiskType::SSD => {
-                    attributes.insert(String::from("disk_type"), String::from("SSD"));
-                }
-                DiskType::HDD => {
-                    attributes.insert(String::from("disk_type"), String::from("HDD"));
-                }
-                DiskType::Unknown(_) => {
-                    attributes.insert(String::from("disk_type"), String::from("Unknown"));
-                }
-            }
-            attributes.insert(
-                String::from("disk_is_removable"),
-                d.is_removable().to_string(),
+        let mut disks: Vec<DiskMetrics> = vec![];
+
+        let sysinfo_disks = sysinfo::Disks::new_with_refreshed_list();
+
+        sysinfo_disks.iter().for_each(|sysinfo_disk| {
+            let file_system = sysinfo_disk.file_system().to_str().unwrap().to_string();
+            let mount_point = sysinfo_disk.mount_point().to_str().unwrap().to_string();
+            let name = sysinfo_disk.name().to_str().unwrap().to_string();
+            let kind = match sysinfo_disk.kind() {
+                DiskKind::HDD => String::from("HDD"),
+                DiskKind::SSD => String::from("SSD"),
+                DiskKind::Unknown(_) => String::from("Unknown"),
+            };
+            let removable = sysinfo_disk.is_removable().to_string();
+            let attributes = Attributes {
+                name,
+                file_system,
+                mount_point,
+                kind,
+                removable,
+            };
+
+            let total_space = sysinfo_disk.total_space().to_string();
+            let total_bytes_record = Record::new(
+                timestamp,
+                total_space,
+                units::Unit::Bytes,
             );
-            if let Some(disk_name) = d.name().to_str() {
-                attributes.insert(String::from("disk_name"), String::from(disk_name));
+            let total_bytes = Metric {
+                name: String::from("scaph_host_disk_total_bytes"),
+                description: String::from("Total disk size, in bytes."),
+                record: total_bytes_record,
+            };
+
+            let available_space = sysinfo_disk.available_space().to_string();
+            let available_bytes_record = Record::new(timestamp, available_space, units::Unit::Bytes);
+            let available_bytes = Metric {
+                name: String::from("scaph_host_disk_available_bytes"),
+                description: String::from("Available disk space, in bytes."),
+                record: available_bytes_record,
+            };
+
+            let metrics = Metrics {
+                total_bytes,
+                available_bytes,
+            };
+
+            let disk_metrics = DiskMetrics {
+                metrics,
+                attributes,
+            };
+            disks.push(disk_metrics);
+
+            #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+            match self.add_sensor_disk(sysinfo_disk) {
+                Ok(_) => info!("Disk with power consumption evaluation added to topology!"),
+                Err(e) => info!("{:?} {e}", sysinfo_disk.name()),
+            };
+        });
+
+        disks
+    }
+
+    /// Adds a representation of an identified physical disk. Sysinfo returns all identified file
+    /// systems ; this can be misleading, especially about their capacity, which is useful in identifying their power specifications.
+    /// Only physical disks and their consumption have to be evaluated.
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    pub fn add_sensor_disk(&mut self, disk: &sysinfo::Disk) -> Result<(), disk::DiskError> {
+        let sensor_disk = EvaluatedDisk::new(disk);
+        match sensor_disk {
+            Ok(mut sd) => {
+                let identified_disks: Vec<&EvaluatedDisk> = self
+                    .disks
+                    .iter()
+                    .filter(|tdisk| tdisk.name == sd.name)
+                    .collect();
+                if identified_disks.is_empty() {
+                    let disk_usage = disk.usage();
+                    let power_model = generate_power_model();
+                    sd.power_model = Some(power_model);
+                    sd.set_power_specs(disk_usage.read_bytes, disk_usage.written_bytes);
+                    self.disks.push(sd);
+                    Ok(())
+                } else {
+                    Err(disk::DiskError::DiskAlreadyPresent)
+                }
             }
-            res.insert(
-                String::from("scaph_host_disk_total_bytes"),
-                (
-                    String::from("Total disk size, in bytes."),
-                    attributes.clone(),
-                    Record::new(timestamp, d.total_space().to_string(), units::Unit::Bytes),
-                ),
-            );
-            res.insert(
-                String::from("scaph_host_disk_available_bytes"),
-                (
-                    String::from("Available disk space, in bytes."),
-                    attributes.clone(),
-                    Record::new(
-                        timestamp,
-                        d.available_space().to_string(),
-                        units::Unit::Bytes,
-                    ),
-                ),
-            );
+            Err(_) => Err(disk::DiskError::NoBlockInSysfs),
         }
-        res
+    }
+
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    pub fn refresh_disks(&mut self, sysinfo_disks: &sysinfo::Disks) {
+        self.disks.iter_mut().for_each(|topology_disk| {
+            let matching_sysinfo_disk: Vec<&sysinfo::Disk> = sysinfo_disks
+                .iter()
+                .filter(|sysinfo_disk| {
+                    let sysinfo_disk_name = format_disk_name(sysinfo_disk.name().to_str().unwrap());
+                    sysinfo_disk_name == topology_disk.name
+                })
+                .collect();
+
+            let usage = matching_sysinfo_disk[0].usage();
+            let read_bytes = usage.read_bytes;
+            let written_bytes = usage.written_bytes;
+            topology_disk.refresh(read_bytes, written_bytes);
+        });
     }
 
     pub fn get_total_memory_bytes(&self) -> Record {
@@ -1607,6 +1683,24 @@ impl Clone for CPUStat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generate_mock_topology() -> Topology {
+        let mut mock_sensor_data = HashMap::new();
+        mock_sensor_data.insert(String::from("key"), String::from("value"));
+        let proc_tracker = ProcessTracker::new(5);
+
+        Topology {
+            sockets: vec![],
+            stat_buffer: vec![],
+            record_buffer: vec![],
+            buffer_max_kbytes: 1,
+            domains_names: None,
+            _sensor_data: mock_sensor_data,
+            proc_tracker,
+            disks: vec![],
+        }
+    }
+
     #[test]
     fn get_proc_cpuinfo() {
         let cores = Topology::generate_cpu_cores().unwrap();
@@ -1659,8 +1753,16 @@ mod tests {
             println!("{:?}", s.read_stats());
         }
     }
-}
 
+    #[test]
+    fn it_should_return_each_disk_with_its_associated_metadata() {
+        let number_of_disks_from_sysinfo = sysinfo::Disks::new_with_refreshed_list().len();
+        let mut topology = generate_mock_topology();
+        let disks = topology.get_disks();
+
+        assert_eq!(disks.len(), number_of_disks_from_sysinfo);
+    }
+}
 //  Copyright 2020 The scaphandre authors.
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
