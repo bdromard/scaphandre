@@ -15,6 +15,7 @@ use disk::{format_disk_name, generate_power_model, EvaluatedDisk};
 pub mod powercap_rapl;
 pub mod units;
 pub mod utils;
+pub mod network;
 #[cfg(target_os = "linux")]
 use procfs::{CpuInfo, CpuTime, KernelStats};
 use std::{collections::HashMap, error::Error, fmt, fs, mem::size_of_val, str, time::Duration};
@@ -1697,6 +1698,7 @@ mod tests {
             domains_names: None,
             _sensor_data: mock_sensor_data,
             proc_tracker,
+            #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
             disks: vec![],
         }
     }

@@ -1,12 +1,14 @@
+use scaphandre::sensors::Topology;
 use scaphandre::sensors::disk::{
-    EvaluatedDisk, DiskKindWrapper, DiskPowerSpecs, DiskRecord, DiskState, FormFactor, PowerModel,
+    DiskKindWrapper, DiskPowerSpecs, DiskRecord, DiskState, EvaluatedDisk, FormFactor, PowerModel,
 };
 use scaphandre::sensors::utils::ProcessTracker;
-use scaphandre::sensors::Topology;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Write;
 use std::{
     fs::{create_dir, create_dir_all, remove_dir_all},
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
 };
 
@@ -86,7 +88,39 @@ pub fn setup_fs_scsi() {
 
     let mock_devices_driver_path = mock_devices_path.join("driver");
 
-    let _ = std::os::unix::fs::symlink(mock_driver_path, mock_devices_driver_path);
+    let _ = symlink(mock_driver_path, mock_devices_driver_path);
+}
+
+pub fn setup_fs_proc() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let tests_dir = Path::new(manifest_dir).join("tests");
+    let tmp_dir = tests_dir.join("tmp");
+
+    let _ = remove_dir_all(tmp_dir.clone());
+
+    create_dir(tmp_dir.clone()).unwrap();
+
+    let mock_proc_path = "proc";
+    let tmp_mock_proc_path = tmp_dir.clone().join(mock_proc_path);
+    let _ = create_dir_all(tmp_mock_proc_path.clone());
+
+    let processes_path = ["123"];
+    let fd_paths = ["1", "2", "3", "4"];
+    let symlinks = [
+        "socket:[12345]",
+        "socket:[67890]",
+        "/home/user/app/file.db",
+        "/home/user/app/otherfile.db",
+    ];
+    processes_path.iter().for_each(|proc_path| {
+        let p = tmp_mock_proc_path.join(proc_path).join("fd");
+        let _ = create_dir_all(&p);
+        fd_paths.iter().enumerate().for_each(|(index, path)| {
+            let to_link = symlinks[index];
+            let fd_p = p.join(path);
+            let _ = symlink(to_link, fd_p);
+        });
+    });
 }
 
 pub fn generate_mock_topology(disks: bool) -> Topology {

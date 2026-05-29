@@ -1133,7 +1133,7 @@ impl MetricGenerator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "disks_evaluation"))]
 mod tests {
     use super::*;
     use crate::sensors::{

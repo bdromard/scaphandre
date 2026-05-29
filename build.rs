@@ -4,16 +4,17 @@ use std::{
     path::Path,
 };
 
-#[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
 // Build script to parse the CSV file in data/disks, in order to have the CSV records available
 // from build time in the binary. For unitary tests, the fixture in tests/fixtures in parsed
-// instead. 
+// instead.
 fn main() {
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("csv_records.rs");
-    fs::write(
-        &dest_path,
-        "pub fn get_default_power_model_path() -> PathBuf {
+    #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
+    {
+        let out_dir = env::var_os("OUT_DIR").unwrap();
+        let dest_path = Path::new(&out_dir).join("csv_records.rs");
+        fs::write(
+            &dest_path,
+            "pub fn get_default_power_model_path() -> PathBuf {
         let cargo_path = env!(\"CARGO_MANIFEST_DIR\");
         
         let power_model_path = Path::new(cargo_path).join(\"data/disks/power_model.csv\");
@@ -36,7 +37,8 @@ fn main() {
         let records = csv::Reader::from_path(path).unwrap();
         records
             }",
-    )
-    .unwrap();
-    println!("cargo::rerun-if-changed=build.rs")
+        )
+        .unwrap();
+        println!("cargo::rerun-if-changed=build.rs")
+    }
 }
