@@ -1,7 +1,7 @@
 use std::{
     fmt::format,
     fs::read_to_string,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -24,6 +24,8 @@ pub enum IpVersion {
 struct IpPacket {
     version: IpVersion,
     protocol: Protocol,
+    source_ip: IpAddr,
+    destination_ip: IpAddr,
     data: Vec<u8>,
 }
 
@@ -36,17 +38,64 @@ impl IpPacket {
             _ => IpVersion::Unknown,
         };
 
-        let protocol_as_bytes = data[9];
+        let protocol_as_bytes = match ip_version {
+            IpVersion::Ipv4 => Some(data[9]),
+            IpVersion::Ipv6 => Some(data[6]),
+            IpVersion::Unknown => None,
+        };
 
-        let protocol = match protocol_as_bytes {
+        println!("{protocol_as_bytes:?}");
+
+        let protocol = match protocol_as_bytes
+            .expect("It should contain a byte specifying the used protocol")
+        {
             6 => Protocol::Tcp,
             17 => Protocol::Udp,
             _ => Protocol::Unknown,
         };
 
+        let source_ip = match ip_version {
+            IpVersion::Ipv4 => Some(IpAddr::V4(Ipv4Addr::new(
+                data[12], data[13], data[14], data[15],
+            ))),
+            IpVersion::Ipv6 => Some(IpAddr::V6(Ipv6Addr::new(
+                u16::from_be_bytes([data[8], data[9]]),
+                u16::from_be_bytes([data[10], data[11]]),
+                u16::from_be_bytes([data[12], data[13]]),
+                u16::from_be_bytes([data[14], data[15]]),
+                u16::from_be_bytes([data[16], data[17]]),
+                u16::from_be_bytes([data[18], data[19]]),
+                u16::from_be_bytes([data[20], data[21]]),
+                u16::from_be_bytes([data[22], data[23]]),
+            ))),
+            _ => None,
+        };
+
+        println!("{:?}", data[39]);
+        let destination_ip = match ip_version {
+            IpVersion::Ipv4 => Some(IpAddr::V4(Ipv4Addr::new(
+                data[16], data[17], data[18], data[19],
+            ))),
+            IpVersion::Ipv6 => Some(IpAddr::V6(Ipv6Addr::new(
+                u16::from_be_bytes([data[24], data[25]]),
+                u16::from_be_bytes([data[26], data[27]]),
+                u16::from_be_bytes([data[28], data[29]]),
+                u16::from_be_bytes([data[30], data[31]]),
+                u16::from_be_bytes([data[32], data[33]]),
+                u16::from_be_bytes([data[34], data[35]]),
+                u16::from_be_bytes([data[36], data[37]]),
+                u16::from_be_bytes([data[38], data[39]]),
+            ))),
+            _ => None,
+        };
+        //let source_ip = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+        //let destination_ip = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
+
         IpPacket {
             version: ip_version,
             protocol,
+            source_ip: source_ip.expect("It should contain an IP address"),
+            destination_ip: destination_ip.expect("It should contain an IP address"),
             data: data.to_vec(),
         }
     }
@@ -55,6 +104,8 @@ impl IpPacket {
 #[derive(Clone)]
 struct TcpPacket {
     protocol: Protocol,
+    source_ip: IpAddr,
+    destination_ip: IpAddr,
     source_address: Option<SocketAddr>,
     destination_address: Option<SocketAddr>,
     size: Option<u64>,
@@ -64,8 +115,14 @@ struct TcpPacket {
 impl TcpPacket {
     fn new(ip_packet: &IpPacket) -> Self {
         let protocol = &ip_packet.protocol;
+
+        let source_ip = &ip_packet.source_ip;
+        let destination_ip = &ip_packet.destination_ip;
+
         TcpPacket {
             protocol: protocol.to_owned(),
+            source_ip: source_ip.to_owned(),
+            destination_ip: destination_ip.to_owned(),
             source_address: None,
             destination_address: None,
             size: None,
@@ -76,22 +133,6 @@ impl TcpPacket {
     fn parse(&mut self) {
         let ip_packet_data = &self.data.clone().unwrap();
 
-        let source_address_bytes = &ip_packet_data[12..16];
-        let destination_address_bytes = &ip_packet_data[16..20];
-
-        let source_ip = Ipv4Addr::new(
-            source_address_bytes[0],
-            source_address_bytes[1],
-            source_address_bytes[2],
-            source_address_bytes[3],
-        );
-        let destination_ip = Ipv4Addr::new(
-            destination_address_bytes[0],
-            destination_address_bytes[1],
-            destination_address_bytes[2],
-            destination_address_bytes[3],
-        );
-
         let packet_without_ip_header = &ip_packet_data[20..];
 
         let packet_length = packet_without_ip_header.len();
@@ -101,22 +142,8 @@ impl TcpPacket {
         let destination_port =
             u16::from_be_bytes([packet_without_ip_header[2], packet_without_ip_header[3]]);
 
-        /*
-        let full_source_address = format!(
-            "{}.{}.{}.{}:{}",
-            source_address[0], source_address[1], source_address[2], source_address[3], source_port
-        );
-        let full_destination_address = format!(
-            "{}.{}.{}.{}:{}",
-            destination_address[0],
-            destination_address[1],
-            destination_address[2],
-            destination_address[3],
-            destination_port,
-        ); */
-
-        let source_address = SocketAddr::new(IpAddr::V4(source_ip), source_port);
-        let destination_address = SocketAddr::new(IpAddr::V4(destination_ip), destination_port);
+        let source_address = SocketAddr::new(self.source_ip, source_port);
+        let destination_address = SocketAddr::new(self.destination_ip, destination_port);
 
         self.source_address = Some(source_address);
         self.destination_address = Some(destination_address);
@@ -232,8 +259,6 @@ pub fn identify_psock_inodes(pid: u32, proc_path: &Path) -> Vec<i32> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::tcp;
-
     use super::*;
     use std::{
         error::Error,
@@ -241,12 +266,12 @@ mod tests {
         path::Path,
     };
 
-    fn ipv4_packet(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn ipv4_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
         let packet = match protocol {
             Protocol::Udp => Ok(vec![
-                69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 83, 10, 128, 31, 18, 10, 64, 0, 1, 144,
-                208, 0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97,
-                116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+                69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208,
+                0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116,
+                6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
             ]),
             Protocol::Tcp => Ok(vec![
                 69, 0, 1, 72, 233, 36, 64, 0, 64, 6, 67, 142, 127, 0, 0, 1, 8, 8, 8, 8, 208, 234,
@@ -274,15 +299,15 @@ mod tests {
         Ok(packet?)
     }
 
-    fn ipv6_packet(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn ipv6_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
         let packet = match protocol {
             Protocol::Udp => Ok(vec![
-                96, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 83, 10, 128, 31, 18, 10, 64, 0, 1, 144,
-                208, 0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97,
-                116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+                96, 0, 0, 61, 92, 138, 17, 0, /* 8*/ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 1, /*24*/ 7, 209, 18, 252, 18, 252, 0, 0, 0, 0, 0, 0, 0, 0, 34, 184, 184,
+                99, 104, 97, 116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
             ]),
             Protocol::Tcp => Ok(vec![
-                96, 0, 0, 61, 92, 138, 64, 0, 64, 6, 170, 83, 10, 128, 31, 18, 10, 64, 0, 1, 144,
+                96, 0, 0, 61, 92, 138, 6, 0, 64, 6, 170, 83, 10, 128, 31, 18, 10, 64, 0, 1, 144,
                 208, 0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97,
                 116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
             ]),
@@ -290,6 +315,16 @@ mod tests {
         };
 
         Ok(packet?)
+    }
+
+    fn ipv4_packet() -> IpPacket {
+        IpPacket {
+            version: IpVersion::Ipv4,
+            protocol: Protocol::Tcp,
+            source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            data: ipv4_packet_bytes(Protocol::Tcp).unwrap(),
+        }
     }
 
     #[test]
@@ -356,7 +391,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_an_ipv4_packet() {
-        let packet = ipv4_packet(Protocol::Udp).unwrap();
+        let packet = ipv4_packet_bytes(Protocol::Udp).unwrap();
 
         let parsed_packet = IpPacket::new(&packet);
 
@@ -365,7 +400,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_an_ipv6_packet() {
-        let packet = ipv6_packet(Protocol::Udp).unwrap();
+        let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
 
         let parsed_packet = IpPacket::new(&packet);
 
@@ -374,7 +409,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_the_udp_protocol_for_an_ip_packet() {
-        let packet = ipv6_packet(Protocol::Udp).unwrap();
+        let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
 
         let parsed_packet = IpPacket::new(&packet);
 
@@ -383,7 +418,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_the_tcp_protocol_for_an_ip_packet() {
-        let packet = ipv6_packet(Protocol::Tcp).unwrap();
+        let packet = ipv6_packet_bytes(Protocol::Tcp).unwrap();
 
         let parsed_packet = IpPacket::new(&packet);
 
@@ -391,13 +426,34 @@ mod tests {
     }
 
     #[test]
-    fn it_should_generate_a_tcp_packet_when_the_correct_protocol_has_been_identified() {
-        let ip_packet = IpPacket {
-            version: IpVersion::Ipv4,
-            protocol: Protocol::Tcp,
-            data: ipv4_packet(Protocol::Tcp).unwrap(),
-        };
+    fn it_should_identify_the_source_and_destination_addresses_for_an_ipv4_packet() {
+        let packet = ipv4_packet_bytes(Protocol::Tcp).unwrap();
 
+        let parsed_packet = IpPacket::new(&packet);
+
+        assert_eq!(parsed_packet.source_ip, Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(parsed_packet.destination_ip, Ipv4Addr::new(8, 8, 8, 8));
+    }
+
+    #[test]
+    fn it_should_identify_the_source_and_destination_addresses_for_an_ipv6_packet() {
+        let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
+
+        let parsed_packet = IpPacket::new(&packet);
+
+        assert_eq!(
+            parsed_packet.source_ip,
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)
+        );
+        assert_eq!(
+            parsed_packet.destination_ip,
+            Ipv6Addr::new(2001, 4860, 4860, 0, 0, 0, 0, 8888)
+        );
+    }
+
+    #[test]
+    fn it_should_generate_a_tcp_packet_when_the_correct_protocol_has_been_identified() {
+        let ip_packet = ipv4_packet();
         let tcp_packet = TcpPacket::new(&ip_packet);
 
         assert_eq!(tcp_packet.protocol, Protocol::Tcp);
@@ -405,11 +461,7 @@ mod tests {
 
     #[test]
     fn it_should_parse_a_tcp_packet_to_get_the_relevant_information() {
-        let ip_packet = IpPacket {
-            version: IpVersion::Ipv4,
-            protocol: Protocol::Tcp,
-            data: ipv4_packet(Protocol::Tcp).unwrap(),
-        };
+        let ip_packet = ipv4_packet();
 
         let mut tcp_packet = TcpPacket::new(&ip_packet);
 
@@ -418,15 +470,9 @@ mod tests {
         let source_addr = tcp_packet.source_address.unwrap();
         let dest_addr = tcp_packet.destination_address.unwrap();
 
-        assert_eq!(
-            source_addr.ip(),
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
-        );
+        assert_eq!(source_addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         assert_eq!(source_addr.port(), 53482);
-        assert_eq!(
-            dest_addr.ip(),
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
-        );
+        assert_eq!(dest_addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert_eq!(dest_addr.port(), 443);
         assert_eq!(tcp_packet.size, Some(308));
         assert_eq!(tcp_packet.data.unwrap().len(), 308);
