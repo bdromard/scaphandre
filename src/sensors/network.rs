@@ -1,5 +1,4 @@
 use std::{
-    fmt::format,
     fs::read_to_string,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -44,8 +43,6 @@ impl IpPacket {
             IpVersion::Unknown => None,
         };
 
-        println!("{protocol_as_bytes:?}");
-
         let protocol = match protocol_as_bytes
             .expect("It should contain a byte specifying the used protocol")
         {
@@ -71,7 +68,6 @@ impl IpPacket {
             _ => None,
         };
 
-        println!("{:?}", data[39]);
         let destination_ip = match ip_version {
             IpVersion::Ipv4 => Some(IpAddr::V4(Ipv4Addr::new(
                 data[16], data[17], data[18], data[19],
@@ -88,8 +84,6 @@ impl IpPacket {
             ))),
             _ => None,
         };
-        //let source_ip = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
-        //let destination_ip = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
 
         IpPacket {
             version: ip_version,
@@ -108,8 +102,8 @@ struct TcpPacket {
     destination_ip: IpAddr,
     source_address: Option<SocketAddr>,
     destination_address: Option<SocketAddr>,
-    size: Option<u64>,
-    data: Option<Vec<u8>>,
+    size: u64,
+    data: Vec<u8>,
 }
 
 impl TcpPacket {
@@ -119,36 +113,31 @@ impl TcpPacket {
         let source_ip = &ip_packet.source_ip;
         let destination_ip = &ip_packet.destination_ip;
 
+        let tcp_packet = &ip_packet.data[20..];
         TcpPacket {
             protocol: protocol.to_owned(),
             source_ip: source_ip.to_owned(),
             destination_ip: destination_ip.to_owned(),
             source_address: None,
             destination_address: None,
-            size: None,
-            data: Some(ip_packet.data.clone()),
+            size: tcp_packet.len() as u64,
+            data: tcp_packet.to_owned(),
         }
     }
 
     fn parse(&mut self) {
-        let ip_packet_data = &self.data.clone().unwrap();
-
-        let packet_without_ip_header = &ip_packet_data[20..];
-
-        let packet_length = packet_without_ip_header.len();
+        let packet = &self.data.to_owned();
 
         let source_port =
-            u16::from_be_bytes([packet_without_ip_header[0], packet_without_ip_header[1]]);
+            u16::from_be_bytes([packet[0], packet[1]]);
         let destination_port =
-            u16::from_be_bytes([packet_without_ip_header[2], packet_without_ip_header[3]]);
+            u16::from_be_bytes([packet[2], packet[3]]);
 
         let source_address = SocketAddr::new(self.source_ip, source_port);
         let destination_address = SocketAddr::new(self.destination_ip, destination_port);
 
         self.source_address = Some(source_address);
         self.destination_address = Some(destination_address);
-        self.size = Some(packet_length as u64);
-        self.data = Some(packet_without_ip_header.to_vec());
     }
 }
 
@@ -311,7 +300,7 @@ mod tests {
                 208, 0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97,
                 116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
             ]),
-            Protocol::Unknown => Err("Not an acknowledged protocol"),
+            Protocol::Unknown => Err("Not an acknowledgable protocol"),
         };
 
         Ok(packet?)
@@ -474,7 +463,7 @@ mod tests {
         assert_eq!(source_addr.port(), 53482);
         assert_eq!(dest_addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert_eq!(dest_addr.port(), 443);
-        assert_eq!(tcp_packet.size, Some(308));
-        assert_eq!(tcp_packet.data.unwrap().len(), 308);
+        assert_eq!(tcp_packet.size, 308);
+        assert_eq!(tcp_packet.data.len(), 308);
     }
 }
