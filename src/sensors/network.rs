@@ -1,10 +1,11 @@
 use std::{
+    error::Error,
     fs::read_to_string,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
-use sysinfo::NetworkData;
+use sysinfo::{IpNetwork, NetworkData};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Protocol {
@@ -128,10 +129,8 @@ impl TcpPacket {
     fn parse(&mut self) {
         let packet = &self.data.to_owned();
 
-        let source_port =
-            u16::from_be_bytes([packet[0], packet[1]]);
-        let destination_port =
-            u16::from_be_bytes([packet[2], packet[3]]);
+        let source_port = u16::from_be_bytes([packet[0], packet[1]]);
+        let destination_port = u16::from_be_bytes([packet[2], packet[3]]);
 
         let source_address = SocketAddr::new(self.source_ip, source_port);
         let destination_address = SocketAddr::new(self.destination_ip, destination_port);
@@ -144,21 +143,20 @@ impl TcpPacket {
 #[derive(Debug, PartialEq)]
 struct Socket {
     inode: i32,
-    process_name: String,
-    protocol: Protocol,
+    process_name: Option<String>,
+    protocol: Option<Protocol>,
+    source_ip: Option<IpAddr>,
+    destination_ip: Option<IpAddr>,
 }
 
 impl Socket {
-    pub fn new(process: &ProcessNetworkMetrics, inodes: &[i32], protocol: &Protocol) -> Self {
-        let socket_inode = inodes
-            .iter()
-            .filter(|inode| process.sockets_inodes.contains(inode))
-            .collect::<Vec<&i32>>()[0];
-
+    pub fn new(inode: i32, source_ip: IpAddr, destination_ip: IpAddr) -> Self {
         Socket {
-            inode: *socket_inode,
-            process_name: process.name.clone(),
-            protocol: protocol.to_owned().clone(),
+            inode,
+            process_name: None,
+            protocol: None,
+            source_ip: Some(source_ip),
+            destination_ip: Some(destination_ip),
         }
     }
 }
@@ -167,6 +165,8 @@ struct NetworkInterface {
     name: String,
     total_received_bytes: u64,
     total_transmitted_bytes: u64,
+    ip_networks: Vec<IpNetwork>,
+    sockets: Option<Vec<Socket>>,
 }
 
 impl NetworkInterface {
@@ -175,7 +175,43 @@ impl NetworkInterface {
             name: sysinfo_interface.0.to_owned(),
             total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
             total_received_bytes: sysinfo_interface.1.total_received(),
+            ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
+            sockets: None,
         }
+    }
+
+    fn identify_sockets(&mut self, sockets_file: PathBuf) {
+        let sockets_lines: Vec<String> = read_to_string(sockets_file)
+            .unwrap()
+            .lines()
+            .map(|line| line.to_string())
+            .collect();
+
+        let sockets: Vec<Socket> = sockets_lines[1..]
+            .iter()
+            .map(|line| {
+                let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
+                let parsing_source_ip =
+                    parse_address_from_hex(formatted_line[1].split(":").collect::<Vec<&str>>()[0]);
+                let source_ip = match parsing_source_ip {
+                    Ok(IpAddr::V4(source_ip)) => Ok(IpAddr::V4(source_ip)),
+                    Ok(IpAddr::V6(source_ip)) => Ok(IpAddr::V6(source_ip)),
+                    Err(_) => Err("Unparsable source IP address"),
+                };
+                let parsing_destination_ip =
+                    parse_address_from_hex(formatted_line[2].split(":").collect::<Vec<&str>>()[0]);
+                let destination_ip = match parsing_destination_ip {
+                    Ok(IpAddr::V4(destination_ip)) => Ok(IpAddr::V4(destination_ip)),
+                    Ok(IpAddr::V6(destination_ip)) => Ok(IpAddr::V6(destination_ip)),
+                    Err(_) => Err("Unparsable source IP address"),
+                };
+                let inode = formatted_line[20].parse::<i32>().unwrap();
+
+                Socket::new(inode, source_ip.unwrap(), destination_ip.unwrap())
+            })
+            .collect();
+
+        self.sockets = Some(sockets);
     }
 }
 
@@ -246,6 +282,132 @@ pub fn identify_psock_inodes(pid: u32, proc_path: &Path) -> Vec<i32> {
     inodes
 }
 
+fn parse_address_from_hex(hex_string: &str) -> Result<IpAddr, Box<dyn Error>> {
+    let string_length = hex_string.len();
+
+    let address = match string_length {
+        8 => Ok(IpAddr::V4(parse_ipv4(hex_string))),
+        32 => Ok(IpAddr::V6(parse_ipv6(hex_string))),
+        _ => Err("Unprocessable hexadecimal string length"),
+    };
+
+    Ok(address?)
+}
+
+fn parse_ipv4(hex_string: &str) -> Ipv4Addr {
+    let characters = hex_string.chars().collect::<Vec<char>>();
+    let first_byte =
+        u8::from_str_radix(format!("{}{}", characters[6], characters[7]).as_str(), 16).unwrap();
+    let second_byte =
+        u8::from_str_radix(format!("{}{}", characters[4], characters[5]).as_str(), 16).unwrap();
+    let third_byte =
+        u8::from_str_radix(format!("{}{}", characters[2], characters[3]).as_str(), 16).unwrap();
+    let fourth_byte =
+        u8::from_str_radix(format!("{}{}", characters[0], characters[1]).as_str(), 16).unwrap();
+
+    Ipv4Addr::new(first_byte, second_byte, third_byte, fourth_byte)
+}
+
+fn parse_ipv6(hex_string: &str) -> Ipv6Addr {
+    let characters = hex_string.chars().collect::<Vec<char>>();
+    let first_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[0], characters[1], characters[2], characters[3]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let second_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[4], characters[5], characters[6], characters[7]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let third_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[8], characters[9], characters[10], characters[11]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let fourth_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[12], characters[13], characters[14], characters[15]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let fifth_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[16], characters[17], characters[18], characters[19]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let sixth_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[20], characters[21], characters[22], characters[23]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let seventh_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[24], characters[25], characters[26], characters[27]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+    let eighth_byte = u16::from_str_radix(
+        format!(
+            "{}{}{}{}",
+            characters[28], characters[29], characters[30], characters[31]
+        )
+        .as_str(),
+        16,
+    )
+    .unwrap();
+
+    Ipv6Addr::new(
+        first_byte,
+        second_byte,
+        third_byte,
+        fourth_byte,
+        fifth_byte,
+        sixth_byte,
+        seventh_byte,
+        eighth_byte,
+    )
+}
+
+fn parse_port_from_hex(hex_string: &str) -> Result<u32, Box<dyn Error>> {
+    let hex_string_length = hex_string.len();
+
+    let port = match hex_string_length {
+        4 => {
+            let port = u16::from_str_radix(hex_string, 16).unwrap();
+            Ok(port as u32)
+        }
+        _ => Err("Unprocessable port string length"),
+    };
+    Ok(port?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,9 +453,9 @@ mod tests {
     fn ipv6_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
         let packet = match protocol {
             Protocol::Udp => Ok(vec![
-                96, 0, 0, 61, 92, 138, 17, 0, /* 8*/ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, /*24*/ 7, 209, 18, 252, 18, 252, 0, 0, 0, 0, 0, 0, 0, 0, 34, 184, 184,
-                99, 104, 97, 116, 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+                96, 0, 0, 61, 92, 138, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 7,
+                209, 18, 252, 18, 252, 0, 0, 0, 0, 0, 0, 0, 0, 34, 184, 184, 99, 104, 97, 116, 6,
+                104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
             ]),
             Protocol::Tcp => Ok(vec![
                 96, 0, 0, 61, 92, 138, 6, 0, 64, 6, 170, 83, 10, 128, 31, 18, 10, 64, 0, 1, 144,
@@ -332,7 +494,70 @@ mod tests {
                 scaph_net_interface.total_transmitted_bytes,
                 interface.1.total_transmitted()
             );
+            assert_eq!(&scaph_net_interface.ip_networks, interface.1.ip_networks())
         });
+    }
+
+    #[test]
+    fn it_should_identify_an_ipv4_address_from_hexadecimal_notation() {
+        let hex_string = "0100007F";
+
+        let parsed_address = parse_address_from_hex(hex_string).unwrap();
+
+        let expected_address = Ipv4Addr::new(127, 0, 0, 1);
+        assert_eq!(parsed_address, expected_address);
+    }
+
+    #[test]
+    fn it_should_identify_an_ipv6_address_from_hexadecimal_notation() {
+        let hex_string = "00000000000000000000000001000000";
+
+        let parsed_address = parse_address_from_hex(hex_string).unwrap();
+
+        let expected_address = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 256, 0);
+        assert_eq!(parsed_address, expected_address);
+    }
+
+    #[test]
+    fn it_should_identify_a_port_from_hexadecimal_notation() {
+        let hex_string = "0277";
+
+        let parsed_port = parse_port_from_hex(hex_string).unwrap();
+
+        let expected_port = 631;
+
+        assert_eq!(parsed_port, expected_port);
+    }
+
+    #[test]
+    fn it_should_identify_the_sockets_linked_to_a_network_interface() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let tcp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/tcp");
+
+        let ip_network = IpNetwork {
+            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            prefix: 0,
+        };
+        let ip_networks: Vec<IpNetwork> = vec![ip_network];
+        let mut network_interface = NetworkInterface {
+            name: String::from("enp1s0"),
+            total_transmitted_bytes: 0,
+            total_received_bytes: 0,
+            ip_networks,
+            sockets: None,
+        };
+
+        network_interface.identify_sockets(tcp_sockets_fixture);
+
+        let expected_destination_ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+
+        let network_sockets = network_interface.sockets.unwrap();
+
+        assert_eq!(network_sockets[3].source_ip, Some(ip_network.addr));
+        assert_eq!(
+            network_sockets[3].destination_ip,
+            Some(expected_destination_ip)
+        );
     }
 
     #[test]
