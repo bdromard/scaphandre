@@ -144,6 +144,7 @@ impl TcpPacket {
 struct Socket {
     inode: i32,
     process_name: Option<String>,
+    pid: Option<u32>,
     protocol: Option<Protocol>,
     source_ip: Option<IpAddr>,
     destination_ip: Option<IpAddr>,
@@ -154,9 +155,27 @@ impl Socket {
         Socket {
             inode,
             process_name: None,
+            pid: None,
             protocol: None,
             source_ip: Some(source_ip),
             destination_ip: Some(destination_ip),
+        }
+    }
+
+    fn identify_process(&mut self, processes: Vec<&ProcessNetworkMetrics>) {
+        let process: Vec<&&ProcessNetworkMetrics> = processes
+            .iter()
+            .filter(|process| {
+                process
+                    .sockets_inodes
+                    .clone()
+                    .unwrap()
+                    .contains(&self.inode)
+            })
+            .collect();
+        if !process.is_empty() {
+            self.process_name = Some(process[0].name.clone());
+            self.pid = Some(process[0].pid);
         }
     }
 }
@@ -218,9 +237,60 @@ impl NetworkInterface {
 pub struct ProcessNetworkMetrics {
     pub name: String,
     pub pid: u32,
-    pub sockets_inodes: Vec<i32>,
+    pub sockets_inodes: Option<Vec<i32>>,
     pub total_received_bytes: u64,
     pub total_transmitted_bytes: u64,
+}
+
+impl ProcessNetworkMetrics {
+    pub fn new(name: &str, pid: u32, total_rx: u64, total_tx: u64) -> Self {
+        ProcessNetworkMetrics {
+            name: name.to_string(),
+            pid,
+            sockets_inodes: None,
+            total_received_bytes: total_rx,
+            total_transmitted_bytes: total_tx,
+        }
+    }
+
+    pub fn identify_psock_inodes(&mut self, proc_path: &Path) {
+        let fd_path = proc_path.join("proc").join(self.pid.to_string()).join("fd");
+
+        let slinks: Vec<String> = fd_path
+            .read_dir()
+            .unwrap()
+            .filter(|entry| {
+                let path = entry.as_ref().unwrap().path();
+                path.is_symlink()
+            })
+            .map(|entry| {
+                let link = entry.unwrap().path().read_link().unwrap();
+                link.to_str().unwrap().to_string()
+            })
+            .collect();
+
+        let sockets: Vec<String> = slinks
+            .iter()
+            .filter(|link| link.starts_with("socket"))
+            .map(|socket| socket.to_string())
+            .collect();
+
+        let mut inodes: Vec<i32> = sockets
+            .iter()
+            .map(|socket| {
+                socket
+                    .strip_prefix("socket:[")
+                    .unwrap()
+                    .strip_suffix("]")
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap()
+            })
+            .collect();
+
+        inodes.sort();
+        self.sockets_inodes = Some(inodes);
+    }
 }
 
 fn find_inodes_for_sockets(sockets_file: PathBuf) -> Vec<i32> {
@@ -584,23 +654,32 @@ mod tests {
 
     #[test]
     fn it_should_identify_a_socket_for_a_given_process() {
-        let identified_tcp_inodes = [37312, 37313, 28907, 16344];
-
-        let process = ProcessNetworkMetrics {
+        let first_process = ProcessNetworkMetrics {
             name: String::from("firefox"),
             pid: 123,
-            sockets_inodes: vec![37312, 37313],
+            sockets_inodes: Some(vec![37312, 37313]),
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
         };
 
-        let protocol = &Protocol::Tcp;
+        let second_process = ProcessNetworkMetrics {
+            name: String::from("signal_desktop"),
+            pid: 456,
+            sockets_inodes: Some(vec![28907, 16344]),
+            total_received_bytes: 0,
+            total_transmitted_bytes: 0,
+        };
 
-        let socket = Socket::new(&process, &identified_tcp_inodes, protocol);
+        let mut socket = Socket::new(
+            37312,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        );
 
-        assert_eq!(socket.process_name, process.name);
-        assert_eq!(socket.protocol, Protocol::Tcp);
-        assert_eq!(socket.inode, 37312);
+        socket.identify_process(vec![&first_process, &second_process]);
+
+        assert_eq!(socket.process_name.unwrap(), first_process.name);
+        assert_eq!(socket.pid.unwrap(), first_process.pid);
     }
 
     #[test]
