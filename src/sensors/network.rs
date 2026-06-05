@@ -7,6 +7,12 @@ use std::{
 
 use sysinfo::{IpNetwork, NetworkData};
 
+#[derive(Debug, PartialEq)]
+pub enum ParsingError {
+    UnparsablePort,
+    UnparsableIpAddress,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Protocol {
     Tcp,
@@ -148,10 +154,18 @@ struct Socket {
     protocol: Option<Protocol>,
     source_ip: Option<IpAddr>,
     destination_ip: Option<IpAddr>,
+    source_port: Option<u32>,
+    destination_port: Option<u32>,
 }
 
 impl Socket {
-    pub fn new(inode: i32, source_ip: IpAddr, destination_ip: IpAddr) -> Self {
+    pub fn new(
+        inode: i32,
+        source_ip: IpAddr,
+        destination_ip: IpAddr,
+        source_port: u32,
+        destination_port: u32,
+    ) -> Self {
         Socket {
             inode,
             process_name: None,
@@ -159,6 +173,8 @@ impl Socket {
             protocol: None,
             source_ip: Some(source_ip),
             destination_ip: Some(destination_ip),
+            source_port: Some(source_port),
+            destination_port: Some(destination_port),
         }
     }
 
@@ -217,34 +233,37 @@ impl NetworkInterface {
             .iter()
             .filter(|line| {
                 let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
-                let parsing_source_ip =
-                    parse_address_from_hex(formatted_line[1].split(":").collect::<Vec<&str>>()[0]);
-                let source_ip = match parsing_source_ip {
-                    Ok(IpAddr::V4(source_ip)) => Ok(IpAddr::V4(source_ip)),
-                    Ok(IpAddr::V6(source_ip)) => Ok(IpAddr::V6(source_ip)),
-                    Err(_) => Err("Unparsable source IP address"),
-                };
-                local_ips.contains(&source_ip.unwrap())
+                let source_ip =
+                    parse_address_from_hex(formatted_line[1].split(":").collect::<Vec<&str>>()[0])
+                        .expect("It should contain the source IP address");
+                local_ips.contains(&source_ip)
             })
             .map(|line| {
                 let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
-                let parsing_source_ip =
-                    parse_address_from_hex(formatted_line[1].split(":").collect::<Vec<&str>>()[0]);
-                let source_ip = match parsing_source_ip {
-                    Ok(IpAddr::V4(source_ip)) => Ok(IpAddr::V4(source_ip)),
-                    Ok(IpAddr::V6(source_ip)) => Ok(IpAddr::V6(source_ip)),
-                    Err(_) => Err("Unparsable source IP address"),
-                };
-                let parsing_destination_ip =
-                    parse_address_from_hex(formatted_line[2].split(":").collect::<Vec<&str>>()[0]);
-                let destination_ip = match parsing_destination_ip {
-                    Ok(IpAddr::V4(destination_ip)) => Ok(IpAddr::V4(destination_ip)),
-                    Ok(IpAddr::V6(destination_ip)) => Ok(IpAddr::V6(destination_ip)),
-                    Err(_) => Err("Unparsable source IP address"),
-                };
-                let inode = formatted_line[20].parse::<i32>().unwrap();
+                let full_source_address = formatted_line[1].split(":").collect::<Vec<&str>>();
+                let source_ip = parse_address_from_hex(full_source_address[0])
+                    .expect("It should contain the source IP address.");
 
-                Socket::new(inode, source_ip.unwrap(), destination_ip.unwrap())
+                let full_destination_address = formatted_line[2].split(":").collect::<Vec<&str>>();
+                let destination_ip = parse_address_from_hex(full_destination_address[0])
+                    .expect("It should contain the destination IP address.");
+
+                let source_port = parse_port_from_hex(full_source_address[1])
+                    .expect("It should contain the source port.");
+                let destination_port = parse_port_from_hex(full_destination_address[1])
+                    .expect("It should contain the destination port.");
+
+                let inode = formatted_line[20]
+                    .parse::<i32>()
+                    .expect("It should parse the socket inode.");
+
+                Socket::new(
+                    inode,
+                    source_ip,
+                    destination_ip,
+                    source_port,
+                    destination_port,
+                )
             })
             .collect();
 
@@ -331,55 +350,14 @@ fn find_inodes_for_sockets(sockets_file: PathBuf) -> Vec<i32> {
     inodes
 }
 
-pub fn identify_psock_inodes(pid: u32, proc_path: &Path) -> Vec<i32> {
-    let fd_path = proc_path.join("proc").join(pid.to_string()).join("fd");
-
-    let slinks: Vec<String> = fd_path
-        .read_dir()
-        .unwrap()
-        .filter(|entry| {
-            let path = entry.as_ref().unwrap().path();
-            path.is_symlink()
-        })
-        .map(|entry| {
-            let link = entry.unwrap().path().read_link().unwrap();
-            link.to_str().unwrap().to_string()
-        })
-        .collect();
-
-    let sockets: Vec<String> = slinks
-        .iter()
-        .filter(|link| link.starts_with("socket"))
-        .map(|socket| socket.to_string())
-        .collect();
-
-    let mut inodes: Vec<i32> = sockets
-        .iter()
-        .map(|socket| {
-            socket
-                .strip_prefix("socket:[")
-                .unwrap()
-                .strip_suffix("]")
-                .unwrap()
-                .parse::<i32>()
-                .unwrap()
-        })
-        .collect();
-
-    inodes.sort();
-    inodes
-}
-
-fn parse_address_from_hex(hex_string: &str) -> Result<IpAddr, Box<dyn Error>> {
+fn parse_address_from_hex(hex_string: &str) -> Result<IpAddr, ParsingError> {
     let string_length = hex_string.len();
 
-    let address = match string_length {
+    match string_length {
         8 => Ok(IpAddr::V4(parse_ipv4(hex_string))),
         32 => Ok(IpAddr::V6(parse_ipv6(hex_string))),
-        _ => Err("Unprocessable hexadecimal string length"),
-    };
-
-    Ok(address?)
+        _ => Err(ParsingError::UnparsableIpAddress),
+    }
 }
 
 fn parse_ipv4(hex_string: &str) -> Ipv4Addr {
@@ -411,17 +389,16 @@ fn parse_ipv6(hex_string: &str) -> Ipv6Addr {
     )
 }
 
-fn parse_port_from_hex(hex_string: &str) -> Result<u32, Box<dyn Error>> {
+fn parse_port_from_hex(hex_string: &str) -> Result<u32, ParsingError> {
     let hex_string_length = hex_string.len();
 
-    let port = match hex_string_length {
+    match hex_string_length {
         4 => {
             let port = u16::from_str_radix(hex_string, 16).unwrap();
             Ok(port as u32)
         }
-        _ => Err("Unprocessable port string length"),
-    };
-    Ok(port?)
+        _ => Err(ParsingError::UnparsablePort),
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +597,8 @@ mod tests {
             37312,
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            631,
+            0,
         );
 
         socket.identify_process(vec![&first_process, &second_process]);
