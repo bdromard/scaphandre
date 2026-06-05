@@ -200,14 +200,32 @@ impl NetworkInterface {
     }
 
     fn identify_sockets(&mut self, sockets_file: PathBuf) {
+        let local_ips: Vec<IpAddr> = self
+            .ip_networks
+            .iter()
+            .map(|network| network.addr)
+            .collect();
         let sockets_lines: Vec<String> = read_to_string(sockets_file)
             .unwrap()
             .lines()
             .map(|line| line.to_string())
             .collect();
 
-        let sockets: Vec<Socket> = sockets_lines[1..]
+        // Checking that the source IP address is among the identified IP adresses linked
+        // to a network interface. If so, create a socket for this network interface.
+        let sockets = sockets_lines[1..]
             .iter()
+            .filter(|line| {
+                let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
+                let parsing_source_ip =
+                    parse_address_from_hex(formatted_line[1].split(":").collect::<Vec<&str>>()[0]);
+                let source_ip = match parsing_source_ip {
+                    Ok(IpAddr::V4(source_ip)) => Ok(IpAddr::V4(source_ip)),
+                    Ok(IpAddr::V6(source_ip)) => Ok(IpAddr::V6(source_ip)),
+                    Err(_) => Err("Unparsable source IP address"),
+                };
+                local_ips.contains(&source_ip.unwrap())
+            })
             .map(|line| {
                 let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
                 let parsing_source_ip =
@@ -366,102 +384,30 @@ fn parse_address_from_hex(hex_string: &str) -> Result<IpAddr, Box<dyn Error>> {
 
 fn parse_ipv4(hex_string: &str) -> Ipv4Addr {
     let characters = hex_string.chars().collect::<Vec<char>>();
-    let first_byte =
-        u8::from_str_radix(format!("{}{}", characters[6], characters[7]).as_str(), 16).unwrap();
-    let second_byte =
-        u8::from_str_radix(format!("{}{}", characters[4], characters[5]).as_str(), 16).unwrap();
-    let third_byte =
-        u8::from_str_radix(format!("{}{}", characters[2], characters[3]).as_str(), 16).unwrap();
-    let fourth_byte =
-        u8::from_str_radix(format!("{}{}", characters[0], characters[1]).as_str(), 16).unwrap();
+    let bytes: Vec<u8> = characters
+        .chunks(2)
+        .map(|chunk| u8::from_str_radix(format!("{}{}", chunk[0], chunk[1]).as_str(), 16).unwrap())
+        .collect();
 
-    Ipv4Addr::new(first_byte, second_byte, third_byte, fourth_byte)
+    // Order is little-endian for IPv4
+    Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0])
 }
 
 fn parse_ipv6(hex_string: &str) -> Ipv6Addr {
     let characters = hex_string.chars().collect::<Vec<char>>();
-    let first_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[0], characters[1], characters[2], characters[3]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let second_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[4], characters[5], characters[6], characters[7]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let third_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[8], characters[9], characters[10], characters[11]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let fourth_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[12], characters[13], characters[14], characters[15]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let fifth_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[16], characters[17], characters[18], characters[19]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let sixth_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[20], characters[21], characters[22], characters[23]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let seventh_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[24], characters[25], characters[26], characters[27]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
-    let eighth_byte = u16::from_str_radix(
-        format!(
-            "{}{}{}{}",
-            characters[28], characters[29], characters[30], characters[31]
-        )
-        .as_str(),
-        16,
-    )
-    .unwrap();
+    let bytes: Vec<u16> = characters
+        .chunks(4)
+        .map(|chunk| {
+            u16::from_str_radix(
+                format!("{}{}{}{}", chunk[0], chunk[1], chunk[2], chunk[3]).as_str(),
+                16,
+            )
+            .unwrap()
+        })
+        .collect();
 
     Ipv6Addr::new(
-        first_byte,
-        second_byte,
-        third_byte,
-        fourth_byte,
-        fifth_byte,
-        sixth_byte,
-        seventh_byte,
-        eighth_byte,
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     )
 }
 
@@ -623,9 +569,9 @@ mod tests {
 
         let network_sockets = network_interface.sockets.unwrap();
 
-        assert_eq!(network_sockets[3].source_ip, Some(ip_network.addr));
+        assert_eq!(network_sockets[0].source_ip, Some(ip_network.addr));
         assert_eq!(
-            network_sockets[3].destination_ip,
+            network_sockets[0].destination_ip,
             Some(expected_destination_ip)
         );
     }
