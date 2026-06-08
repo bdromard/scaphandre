@@ -146,6 +146,49 @@ impl TcpPacket {
     }
 }
 
+struct UdpPacket {
+    protocol: Protocol,
+    source_ip: IpAddr,
+    destination_ip: IpAddr,
+    source_address: Option<SocketAddr>,
+    destination_address: Option<SocketAddr>,
+    size: u64,
+    data: Vec<u8>,
+}
+
+impl UdpPacket {
+    fn new(ip_packet: &IpPacket) -> Self {
+        let protocol = &ip_packet.protocol;
+        let source_ip = &ip_packet.source_ip;
+        let destination_ip = &ip_packet.destination_ip;
+
+        let udp_packet = &ip_packet.data[20..];
+
+        UdpPacket {
+            protocol: protocol.to_owned(),
+            source_ip: source_ip.to_owned(),
+            destination_ip: destination_ip.to_owned(),
+            source_address: None,
+            destination_address: None,
+            size: udp_packet.len() as u64,
+            data: udp_packet.to_owned(),
+        }
+    }
+
+    fn parse(&mut self) {
+        let packet = &self.data.to_owned();
+
+        let source_port = u16::from_be_bytes([packet[0], packet[1]]);
+        let destination_port = u16::from_be_bytes([packet[2], packet[3]]);
+
+        let source_address = SocketAddr::new(self.source_ip, source_port);
+        let destination_address = SocketAddr::new(self.destination_ip, destination_port);
+
+        self.source_address = Some(source_address);
+        self.destination_address = Some(destination_address);
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Socket {
     inode: i32,
@@ -401,6 +444,24 @@ fn parse_port_from_hex(hex_string: &str) -> Result<u32, ParsingError> {
     }
 }
 
+fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
+    let size = match protocol {
+        Protocol::Tcp => {
+            let total_packet_size = (data.len() * 8) as u32;
+            let tcp_header_size = (data[12] >> 4) as u32;
+            Ok(total_packet_size - (tcp_header_size * 32))
+        }
+        Protocol::Udp => {
+            let total_packet_size = (data.len() * 8) as u32;
+            let udp_header_size = 16;
+            Ok(total_packet_size - udp_header_size)
+        }
+        Protocol::Unknown => Err("Not a parsable protocol"),
+    };
+
+    size.unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,13 +522,23 @@ mod tests {
         Ok(packet?)
     }
 
-    fn ipv4_packet() -> IpPacket {
+    fn ipv4_packet_tcp() -> IpPacket {
         IpPacket {
             version: IpVersion::Ipv4,
             protocol: Protocol::Tcp,
             source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             data: ipv4_packet_bytes(Protocol::Tcp).unwrap(),
+        }
+    }
+
+    fn ipv4_packet_udp() -> IpPacket {
+        IpPacket {
+            version: IpVersion::Ipv4,
+            protocol: Protocol::Udp,
+            source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            data: ipv4_packet_bytes(Protocol::Udp).unwrap(),
         }
     }
 
@@ -671,7 +742,7 @@ mod tests {
 
     #[test]
     fn it_should_generate_a_tcp_packet_when_the_correct_protocol_has_been_identified() {
-        let ip_packet = ipv4_packet();
+        let ip_packet = ipv4_packet_tcp();
         let tcp_packet = TcpPacket::new(&ip_packet);
 
         assert_eq!(tcp_packet.protocol, Protocol::Tcp);
@@ -679,7 +750,7 @@ mod tests {
 
     #[test]
     fn it_should_parse_a_tcp_packet_to_get_the_relevant_information() {
-        let ip_packet = ipv4_packet();
+        let ip_packet = ipv4_packet_tcp();
 
         let mut tcp_packet = TcpPacket::new(&ip_packet);
 
@@ -694,5 +765,56 @@ mod tests {
         assert_eq!(dest_addr.port(), 443);
         assert_eq!(tcp_packet.size, 308);
         assert_eq!(tcp_packet.data.len(), 308);
+    }
+
+    #[test]
+    fn it_should_identify_the_application_packet_size_from_a_tcp_packet() {
+        let ip_packet = ipv4_packet_tcp();
+        let tcp_packet = TcpPacket::new(&ip_packet);
+
+        let expected_size = ((tcp_packet.data.len() * 8) - 256) as u32;
+        let identified_size = identify_app_packet_size(&tcp_packet.data, Protocol::Tcp);
+
+        assert_eq!(identified_size, expected_size);
+    }
+
+    #[test]
+    fn it_should_generate_an_udp_packet_when_the_correct_protocol_has_been_identified() {
+        let ip_packet = ipv4_packet_udp();
+        let udp_packet = UdpPacket::new(&ip_packet);
+
+        assert_eq!(udp_packet.protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn it_should_parse_a_udp_packet_to_get_the_relevant_information() {
+        let ip_packet = ipv4_packet_udp();
+
+        let mut udp_packet = UdpPacket::new(&ip_packet);
+
+        udp_packet.parse();
+
+        let source_addr = udp_packet.source_address.unwrap();
+        let dest_addr = udp_packet.destination_address.unwrap();
+
+        let expected_size = ip_packet.data[20..].len();
+
+        assert_eq!(source_addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(source_addr.port(), 37072);
+        assert_eq!(dest_addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(dest_addr.port(), 53);
+        assert_eq!(udp_packet.size, expected_size as u64);
+        assert_eq!(udp_packet.data.len(), expected_size);
+    }
+
+    #[test]
+    fn it_should_identify_the_application_packet_size_from_a_udp_packet() {
+        let ip_packet = ipv4_packet_udp();
+        let udp_packet = UdpPacket::new(&ip_packet);
+
+        let expected_size = ((udp_packet.data.len() * 8) - 16) as u32;
+        let identified_size = identify_app_packet_size(&udp_packet.data, Protocol::Udp);
+
+        assert_eq!(identified_size, expected_size);
     }
 }
