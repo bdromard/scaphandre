@@ -216,10 +216,16 @@ impl Socket {
     }
 
     fn evaluate_packets_size(&mut self) {
-        let total_size = self.packets.clone().unwrap().iter().map(|packet| {
-            let size = identify_app_packet_size(&packet.data, self.protocol.clone().unwrap());
-            size as u64
-        }).sum();
+        let total_size = self
+            .packets
+            .clone()
+            .unwrap()
+            .iter()
+            .map(|packet| {
+                let size = identify_app_packet_size(&packet.data, self.protocol.clone().unwrap());
+                size as u64
+            })
+            .sum();
         self.app_packets_size = Some(total_size);
     }
 }
@@ -308,13 +314,13 @@ pub struct ProcessNetworkMetrics {
 }
 
 impl ProcessNetworkMetrics {
-    pub fn new(name: &str, pid: u32, total_rx: u64, total_tx: u64) -> Self {
+    pub fn new(name: &str, pid: u32) -> Self {
         ProcessNetworkMetrics {
             name: name.to_string(),
             pid,
             sockets_inodes: None,
-            total_received_bytes: total_rx,
-            total_transmitted_bytes: total_tx,
+            total_received_bytes: 0,
+            total_transmitted_bytes: 0,
         }
     }
 
@@ -355,6 +361,31 @@ impl ProcessNetworkMetrics {
 
         inodes.sort();
         self.sockets_inodes = Some(inodes);
+    }
+
+    pub fn update_traffic(&mut self, sockets: &[Socket]) {
+        let incoming_sockets: Vec<&Socket> = sockets
+            .iter()
+            .filter(|socket| socket.direction == Some(Direction::Incoming))
+            .collect();
+
+        let outgoing_sockets: Vec<&Socket> = sockets
+            .iter()
+            .filter(|socket| socket.direction == Some(Direction::Outgoing))
+            .collect();
+
+        let total_received_traffic: u64 = incoming_sockets
+            .iter()
+            .map(|socket| socket.app_packets_size.unwrap())
+            .sum();
+
+        let total_transmitted_traffic: u64 = outgoing_sockets
+            .iter()
+            .map(|socket| socket.app_packets_size.unwrap())
+            .sum();
+
+        self.total_received_bytes += total_received_traffic;
+        self.total_transmitted_bytes += total_transmitted_traffic;
     }
 }
 
@@ -550,6 +581,32 @@ mod tests {
             direction: Some(Direction::Outgoing),
             packets: None,
             app_packets_size: None,
+        }
+    }
+
+    fn local_socket() -> Socket {
+        Socket {
+            inode: 123,
+            process_name: Some(String::from("firefox")),
+            pid: Some(123),
+            protocol: Some(Protocol::Tcp),
+            source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            destination_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            source_port: Some(123),
+            destination_port: Some(456),
+            direction: None,
+            packets: None,
+            app_packets_size: None,
+        }
+    }
+
+    fn process() -> ProcessNetworkMetrics {
+        ProcessNetworkMetrics {
+            name: String::from("firefox"),
+            pid: 123,
+            sockets_inodes: Some(vec![37312, 37313]),
+            total_received_bytes: 0,
+            total_transmitted_bytes: 0,
         }
     }
 
@@ -909,5 +966,47 @@ mod tests {
         let expected_size = (((tcp_packet.data.len() * 8) - 256) * 2) as u64;
 
         assert_eq!(socket.app_packets_size.unwrap(), expected_size);
+    }
+
+    #[test]
+    fn it_should_update_a_process_network_metrics_with_its_associated_sockets_traffic() {
+        let mut process = process();
+
+        let process_inodes = process.sockets_inodes.clone().unwrap();
+
+        let first_socket = Socket {
+            inode: process_inodes[0],
+            process_name: Some(String::from("firefox")),
+            pid: Some(process.pid),
+            protocol: Some(Protocol::Tcp),
+            source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            source_port: Some(123),
+            destination_port: Some(456),
+            direction: Some(Direction::Outgoing),
+            packets: None,
+            app_packets_size: Some(1024),
+        };
+
+        let second_socket = Socket {
+            inode: process_inodes[1],
+            process_name: Some(String::from("firefox")),
+            pid: Some(process.pid),
+            protocol: Some(Protocol::Tcp),
+            source_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            destination_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            source_port: Some(123),
+            destination_port: Some(456),
+            direction: Some(Direction::Incoming),
+            packets: None,
+            app_packets_size: Some(2056),
+        };
+
+        let sockets = vec![first_socket, second_socket];
+
+        process.update_traffic(&sockets);
+
+        assert_eq!(process.total_transmitted_bytes, 1024);
+        assert_eq!(process.total_received_bytes, 2056);
     }
 }
