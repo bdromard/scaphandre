@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fs::read_to_string,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -25,6 +24,12 @@ pub enum IpVersion {
     Ipv4,
     Ipv6,
     Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
 }
 
 struct IpPacket {
@@ -102,8 +107,8 @@ impl IpPacket {
     }
 }
 
-#[derive(Clone)]
-struct TcpPacket {
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransportLayerPacket {
     protocol: Protocol,
     source_ip: IpAddr,
     destination_ip: IpAddr,
@@ -113,7 +118,7 @@ struct TcpPacket {
     data: Vec<u8>,
 }
 
-impl TcpPacket {
+impl TransportLayerPacket {
     fn new(ip_packet: &IpPacket) -> Self {
         let protocol = &ip_packet.protocol;
 
@@ -121,7 +126,7 @@ impl TcpPacket {
         let destination_ip = &ip_packet.destination_ip;
 
         let tcp_packet = &ip_packet.data[20..];
-        TcpPacket {
+        TransportLayerPacket {
             protocol: protocol.to_owned(),
             source_ip: source_ip.to_owned(),
             destination_ip: destination_ip.to_owned(),
@@ -129,49 +134,6 @@ impl TcpPacket {
             destination_address: None,
             size: tcp_packet.len() as u64,
             data: tcp_packet.to_owned(),
-        }
-    }
-
-    fn parse(&mut self) {
-        let packet = &self.data.to_owned();
-
-        let source_port = u16::from_be_bytes([packet[0], packet[1]]);
-        let destination_port = u16::from_be_bytes([packet[2], packet[3]]);
-
-        let source_address = SocketAddr::new(self.source_ip, source_port);
-        let destination_address = SocketAddr::new(self.destination_ip, destination_port);
-
-        self.source_address = Some(source_address);
-        self.destination_address = Some(destination_address);
-    }
-}
-
-struct UdpPacket {
-    protocol: Protocol,
-    source_ip: IpAddr,
-    destination_ip: IpAddr,
-    source_address: Option<SocketAddr>,
-    destination_address: Option<SocketAddr>,
-    size: u64,
-    data: Vec<u8>,
-}
-
-impl UdpPacket {
-    fn new(ip_packet: &IpPacket) -> Self {
-        let protocol = &ip_packet.protocol;
-        let source_ip = &ip_packet.source_ip;
-        let destination_ip = &ip_packet.destination_ip;
-
-        let udp_packet = &ip_packet.data[20..];
-
-        UdpPacket {
-            protocol: protocol.to_owned(),
-            source_ip: source_ip.to_owned(),
-            destination_ip: destination_ip.to_owned(),
-            source_address: None,
-            destination_address: None,
-            size: udp_packet.len() as u64,
-            data: udp_packet.to_owned(),
         }
     }
 
@@ -199,6 +161,9 @@ struct Socket {
     destination_ip: Option<IpAddr>,
     source_port: Option<u32>,
     destination_port: Option<u32>,
+    direction: Option<Direction>,
+    packets: Option<Vec<TransportLayerPacket>>,
+    app_packets_size: Option<u64>,
 }
 
 impl Socket {
@@ -218,6 +183,9 @@ impl Socket {
             destination_ip: Some(destination_ip),
             source_port: Some(source_port),
             destination_port: Some(destination_port),
+            direction: None,
+            packets: None,
+            app_packets_size: None,
         }
     }
 
@@ -236,6 +204,21 @@ impl Socket {
             self.process_name = Some(process[0].name.clone());
             self.pid = Some(process[0].pid);
         }
+    }
+
+    fn set_direction(&mut self, local_ips: &[IpAddr]) {
+        let source_ip = self.source_ip.unwrap();
+        let direction = get_direction(&source_ip, local_ips);
+
+        self.direction = Some(direction);
+    }
+
+    fn evaluate_packets_size(&mut self) {
+        let total_size = self.packets.clone().unwrap().iter().map(|packet| {
+            let size = identify_app_packet_size(&packet.data, self.protocol.clone().unwrap());
+            size as u64
+        }).sum();
+        self.app_packets_size = Some(total_size);
     }
 }
 
@@ -462,8 +445,11 @@ fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
     size.unwrap()
 }
 
-fn check_packet_direction(source_ip: &IpAddr, local_ips: &[IpAddr]) -> bool {
-    local_ips.contains(source_ip)
+fn get_direction(source_ip: &IpAddr, local_ips: &[IpAddr]) -> Direction {
+    match local_ips.contains(source_ip) {
+        true => Direction::Outgoing,
+        false => Direction::Incoming,
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +529,22 @@ mod tests {
             source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             data: ipv4_packet_bytes(Protocol::Udp).unwrap(),
+        }
+    }
+
+    fn outgoing_socket() -> Socket {
+        Socket {
+            inode: 123,
+            process_name: Some(String::from("firefox")),
+            pid: Some(123),
+            protocol: Some(Protocol::Tcp),
+            source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            source_port: Some(123),
+            destination_port: Some(456),
+            direction: Some(Direction::Outgoing),
+            packets: None,
+            app_packets_size: None,
         }
     }
 
@@ -747,7 +749,7 @@ mod tests {
     #[test]
     fn it_should_generate_a_tcp_packet_when_the_correct_protocol_has_been_identified() {
         let ip_packet = ipv4_packet_tcp();
-        let tcp_packet = TcpPacket::new(&ip_packet);
+        let tcp_packet = TransportLayerPacket::new(&ip_packet);
 
         assert_eq!(tcp_packet.protocol, Protocol::Tcp);
     }
@@ -756,7 +758,7 @@ mod tests {
     fn it_should_parse_a_tcp_packet_to_get_the_relevant_information() {
         let ip_packet = ipv4_packet_tcp();
 
-        let mut tcp_packet = TcpPacket::new(&ip_packet);
+        let mut tcp_packet = TransportLayerPacket::new(&ip_packet);
 
         tcp_packet.parse();
 
@@ -774,7 +776,7 @@ mod tests {
     #[test]
     fn it_should_identify_the_application_packet_size_from_a_tcp_packet() {
         let ip_packet = ipv4_packet_tcp();
-        let tcp_packet = TcpPacket::new(&ip_packet);
+        let tcp_packet = TransportLayerPacket::new(&ip_packet);
 
         let expected_size = ((tcp_packet.data.len() * 8) - 256) as u32;
         let identified_size = identify_app_packet_size(&tcp_packet.data, Protocol::Tcp);
@@ -785,7 +787,7 @@ mod tests {
     #[test]
     fn it_should_generate_an_udp_packet_when_the_correct_protocol_has_been_identified() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = UdpPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet);
 
         assert_eq!(udp_packet.protocol, Protocol::Udp);
     }
@@ -794,7 +796,7 @@ mod tests {
     fn it_should_parse_a_udp_packet_to_get_the_relevant_information() {
         let ip_packet = ipv4_packet_udp();
 
-        let mut udp_packet = UdpPacket::new(&ip_packet);
+        let mut udp_packet = TransportLayerPacket::new(&ip_packet);
 
         udp_packet.parse();
 
@@ -814,7 +816,7 @@ mod tests {
     #[test]
     fn it_should_identify_the_application_packet_size_from_a_udp_packet() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = UdpPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet);
 
         let expected_size = ((udp_packet.data.len() * 8) - 16) as u32;
         let identified_size = identify_app_packet_size(&udp_packet.data, Protocol::Udp);
@@ -825,13 +827,13 @@ mod tests {
     #[test]
     fn it_should_identify_if_a_packet_is_outgoing() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = UdpPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet);
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
-        let is_outgoing = check_packet_direction(&udp_packet.source_ip, &local_ips);
+        let is_outgoing = get_direction(&udp_packet.source_ip, &local_ips);
 
-        assert!(is_outgoing);
+        assert_eq!(is_outgoing, Direction::Outgoing);
     }
 
     #[test]
@@ -848,12 +850,42 @@ mod tests {
             destination_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             data,
         };
-        let incoming_udp_packet = UdpPacket::new(&ip_packet);
+        let incoming_udp_packet = TransportLayerPacket::new(&ip_packet);
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
-        let is_incoming = check_packet_direction(&incoming_udp_packet.source_ip, &local_ips);
+        let is_incoming = get_direction(&incoming_udp_packet.source_ip, &local_ips);
 
-        assert!(!is_incoming);
+        assert_eq!(is_incoming, Direction::Incoming);
+    }
+
+    #[test]
+    fn it_should_assign_a_direction_to_a_socket() {
+        let mut socket = Socket::new(
+            123,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            123,
+            456,
+        );
+        let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+        socket.set_direction(&local_ips);
+
+        assert_eq!(socket.direction.unwrap(), Direction::Outgoing);
+    }
+
+    #[test]
+    fn it_should_estimate_the_packets_total_size_for_a_socket() {
+        let mut socket = outgoing_socket();
+        let ip_packet = ipv4_packet_tcp();
+        let tcp_packet = TransportLayerPacket::new(&ip_packet);
+        let tcp_packets = vec![tcp_packet.clone(), tcp_packet.clone()];
+
+        socket.packets = Some(tcp_packets);
+        socket.evaluate_packets_size();
+
+        let expected_size = (((tcp_packet.data.len() * 8) - 256) * 2) as u64;
+
+        assert_eq!(socket.app_packets_size.unwrap(), expected_size);
     }
 }
