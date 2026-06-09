@@ -139,6 +139,9 @@ impl IpPacket {
     }
 }
 
+/// This structure represents either a TCP or UDP packet. For the relevant data needed to estimate
+/// the outgoing or incoming traffic per process, the packet parsing logic is the same. Depending
+/// on future needs, this might evolve to a trait with a different parsing logic for each protocol.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransportLayerPacket {
     protocol: Protocol,
@@ -157,18 +160,19 @@ impl TransportLayerPacket {
         let source_ip = &ip_packet.source_ip;
         let destination_ip = &ip_packet.destination_ip;
 
-        let tcp_packet = &ip_packet.data[20..];
+        let packet = &ip_packet.data[20..];
         TransportLayerPacket {
             protocol: protocol.to_owned(),
             source_ip: source_ip.to_owned(),
             destination_ip: destination_ip.to_owned(),
             source_address: None,
             destination_address: None,
-            size: tcp_packet.len() as u64,
-            data: tcp_packet.to_owned(),
+            size: packet.len() as u64,
+            data: packet.to_owned(),
         }
     }
 
+    // UDP and TCP packets contain both ports in their header in the same location.
     fn parse(&mut self) {
         let packet = &self.data.to_owned();
 
@@ -183,6 +187,9 @@ impl TransportLayerPacket {
     }
 }
 
+/// This structure contains either a TCP(6) or UDP(6) listening socket, as parsed from the
+/// /proc/net/tcp(6) or /proc/net(6) files. It is meant to be allocated to a specific network
+/// interface.
 #[derive(Debug, PartialEq)]
 pub struct Socket {
     inode: i32,
@@ -221,6 +228,7 @@ impl Socket {
         }
     }
 
+    /// A socket must have a unique process to which it is associated.
     fn identify_process(&mut self, processes: Vec<&ProcessNetworkMetrics>) {
         let process: Vec<&&ProcessNetworkMetrics> = processes
             .iter()
@@ -261,6 +269,9 @@ impl Socket {
     }
 }
 
+/// This structure contains the relevant information for a network interface (wired, wireless...).
+/// It holds the sockets through which a connection is established, and these sockets are meant to
+/// be continually updated at runtime.
 struct NetworkInterface {
     name: String,
     total_received_bytes: u64,
@@ -336,6 +347,9 @@ impl NetworkInterface {
     }
 }
 
+/// This structure contains the relevant information about a process network metrics. Scaphandre
+/// already identifies processes at runtime ; this could be used either to update the exposed
+/// information for each process, or as a separate object.
 pub struct ProcessNetworkMetrics {
     pub name: String,
     pub pid: u32,
@@ -355,6 +369,8 @@ impl ProcessNetworkMetrics {
         }
     }
 
+    /// Each process can be associated to several sockets. For each process, inodes in
+    /// /proc/<pid>/fd can be associated to a socket as a symbolic link, and this can be done by parsing that directory.
     pub fn identify_psock_inodes(&mut self, proc_path: &Path) {
         let fd_path = proc_path.join("proc").join(self.pid.to_string()).join("fd");
 
@@ -509,6 +525,9 @@ fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
     size.unwrap()
 }
 
+/// Identifying the traffic direction, in order to allocate the relevant traffic throughput to a
+/// process receiving or transmitting bytes. Some applications can use TCP / UDP sockets for local
+/// traffic. These local sockets should be ignored at the moment.
 fn get_direction(source_ip: &IpAddr, direction_ip: &IpAddr, local_ips: &[IpAddr]) -> Direction {
     match local_ips.contains(source_ip) {
         true => match local_ips.contains(direction_ip) {
