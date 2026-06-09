@@ -30,6 +30,7 @@ pub enum IpVersion {
 pub enum Direction {
     Outgoing,
     Incoming,
+    Local,
 }
 
 struct IpPacket {
@@ -152,7 +153,7 @@ impl TransportLayerPacket {
 }
 
 #[derive(Debug, PartialEq)]
-struct Socket {
+pub struct Socket {
     inode: i32,
     process_name: Option<String>,
     pid: Option<u32>,
@@ -208,7 +209,8 @@ impl Socket {
 
     fn set_direction(&mut self, local_ips: &[IpAddr]) {
         let source_ip = self.source_ip.unwrap();
-        let direction = get_direction(&source_ip, local_ips);
+        let destination_ip = self.destination_ip.unwrap();
+        let direction = get_direction(&source_ip, &destination_ip, local_ips);
 
         self.direction = Some(direction);
     }
@@ -445,9 +447,12 @@ fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
     size.unwrap()
 }
 
-fn get_direction(source_ip: &IpAddr, local_ips: &[IpAddr]) -> Direction {
+fn get_direction(source_ip: &IpAddr, direction_ip: &IpAddr, local_ips: &[IpAddr]) -> Direction {
     match local_ips.contains(source_ip) {
-        true => Direction::Outgoing,
+        true => match local_ips.contains(direction_ip) {
+            true => Direction::Local,
+            false => Direction::Outgoing,
+        },
         false => Direction::Incoming,
     }
 }
@@ -831,7 +836,11 @@ mod tests {
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
-        let is_outgoing = get_direction(&udp_packet.source_ip, &local_ips);
+        let is_outgoing = get_direction(
+            &udp_packet.source_ip,
+            &udp_packet.destination_ip,
+            &local_ips,
+        );
 
         assert_eq!(is_outgoing, Direction::Outgoing);
     }
@@ -854,7 +863,11 @@ mod tests {
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
-        let is_incoming = get_direction(&incoming_udp_packet.source_ip, &local_ips);
+        let is_incoming = get_direction(
+            &incoming_udp_packet.source_ip,
+            &incoming_udp_packet.destination_ip,
+            &local_ips,
+        );
 
         assert_eq!(is_incoming, Direction::Incoming);
     }
@@ -872,6 +885,15 @@ mod tests {
         socket.set_direction(&local_ips);
 
         assert_eq!(socket.direction.unwrap(), Direction::Outgoing);
+    }
+
+    #[test]
+    fn it_should_identify_a_local_socket() {
+        let mut socket = local_socket();
+        let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+        socket.set_direction(&local_ips);
+
+        assert_eq!(socket.direction.unwrap(), Direction::Local);
     }
 
     #[test]
