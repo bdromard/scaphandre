@@ -33,6 +33,37 @@ pub enum Direction {
     Local,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum PacketType {
+    Ethernet,
+    RawIp,
+    Unknown,
+}
+
+struct Packet {
+    datalink_type: i32,
+    data: Vec<u8>,
+    packet_type: Option<PacketType>,
+}
+
+impl Packet {
+    fn new(datalink_type: &i32, data: &[u8]) -> Self {
+        Packet {
+            datalink_type: datalink_type.to_owned(),
+            data: data.to_owned(),
+            packet_type: None,
+        }
+    }
+
+    fn identify(&self) -> PacketType {
+        match self.datalink_type {
+            1 => PacketType::Ethernet,
+            101 => PacketType::RawIp,
+            _ => PacketType::Unknown,
+        }
+    }
+}
+
 struct IpPacket {
     version: IpVersion,
     protocol: Protocol,
@@ -496,6 +527,15 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         path::Path,
     };
+
+    fn ethernet_trame() -> Vec<u8> {
+        vec![
+            51, 51, 255, 96, 226, 40, 112, 252, 143, 147, 10, 214, 134, 221, 69, 0, 0, 61, 92, 138,
+            64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0, 53, 0, 41, 52, 13, 201,
+            243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104, 117, 98, 98, 108, 111,
+            3, 111, 114, 103, 0, 0, 1, 0, 1,
+        ]
+    }
 
     fn ipv4_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
         let packet = match protocol {
@@ -1008,5 +1048,18 @@ mod tests {
 
         assert_eq!(process.total_transmitted_bytes, 1024);
         assert_eq!(process.total_received_bytes, 2056);
+    }
+
+    #[test]
+    fn it_should_identify_accordingly_a_captured_ethernet_trame_depending_on_the_data_link_type() {
+        let ethernet_dlt = 1;
+        let ethernet_trame = ethernet_trame();
+
+        let packet = Packet::new(&ethernet_dlt, &ethernet_trame);
+        let identified_type = packet.identify();
+
+        let expected_type = PacketType::Ethernet;
+
+        assert_eq!(identified_type, expected_type);
     }
 }
