@@ -462,6 +462,10 @@ fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
     size.unwrap()
 }
 
+fn check_packet_direction(source_ip: &IpAddr, local_ips: &[IpAddr]) -> bool {
+    local_ips.contains(source_ip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +820,40 @@ mod tests {
         let identified_size = identify_app_packet_size(&udp_packet.data, Protocol::Udp);
 
         assert_eq!(identified_size, expected_size);
+    }
+
+    #[test]
+    fn it_should_identify_if_a_packet_is_outgoing() {
+        let ip_packet = ipv4_packet_udp();
+        let udp_packet = UdpPacket::new(&ip_packet);
+
+        let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+
+        let is_outgoing = check_packet_direction(&udp_packet.source_ip, &local_ips);
+
+        assert!(is_outgoing);
+    }
+
+    #[test]
+    fn it_should_identify_if_a_packet_is_incoming() {
+        let data = vec![
+            69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 8, 8, 8, 8, 127, 0, 0, 1, 1, 144, 208, 0,
+            53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104,
+            117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+        ];
+        let ip_packet = IpPacket {
+            version: IpVersion::Ipv4,
+            protocol: Protocol::Tcp,
+            source_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            destination_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            data,
+        };
+        let incoming_udp_packet = UdpPacket::new(&ip_packet);
+
+        let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+
+        let is_incoming = check_packet_direction(&incoming_udp_packet.source_ip, &local_ips);
+
+        assert!(!is_incoming);
     }
 }
