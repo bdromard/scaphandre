@@ -43,26 +43,69 @@ pub enum PacketType {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum EtherType {
+    VlanTagged,
+    NotVlanTagged,
+}
+
 struct Packet {
     datalink_type: i32,
     data: Vec<u8>,
     packet_type: Option<PacketType>,
 }
 
+/// This structure is used to first distinguish between Ethernet frames and raw IP packets ;
+/// depending on the datalink type at the link layer, pcap will either return one or the other.
+/// pcap can return the datalink type for the monitored network interface, and it is therefore used
+/// in identifying the packet type and returning the payload.
 impl Packet {
     fn new(datalink_type: &i32, data: &[u8]) -> Self {
-        Packet {
+        let mut packet = Packet {
             datalink_type: datalink_type.to_owned(),
             data: data.to_owned(),
             packet_type: None,
-        }
+        };
+        let packet_type = packet.identify();
+        packet.packet_type = Some(packet_type);
+        packet
     }
 
     fn identify(&self) -> PacketType {
         match self.datalink_type {
             1 => PacketType::Ethernet,
-            101 => PacketType::RawIp,
+            // 12 (RawIp without link layer), 101 (DLT_RAW), 228 (DLT_IPV4), 229 (DLT_IPV6) all
+            //    indicate a raw IP packet.
+            12 | 101 | 228 | 229 => PacketType::RawIp,
             _ => PacketType::Unknown,
+        }
+    }
+
+    fn payload(&self) -> Vec<u8> {
+        match self.packet_type.clone().unwrap() {
+            PacketType::Ethernet => {
+                let ethertype = self.parse_ethertype();
+                match ethertype {
+                    EtherType::NotVlanTagged => self.data[14..].to_vec(),
+                    EtherType::VlanTagged => self.data[18..].to_vec(),
+                }
+            }
+            PacketType::RawIp => self.data.to_vec(),
+            PacketType::Unknown => todo!(),
+        }
+    }
+
+    fn parse_ethertype(&self) -> EtherType {
+        let data = &self.data;
+
+        let ethertype = u16::from_be_bytes([data[12], data[13]]);
+
+        match ethertype {
+            // 0x8100 indicates VLAN-tagging, and therefore a 18-byte Ethernet frame header
+            33024 => EtherType::VlanTagged,
+            // For the moment, we do not have to pay too much attention to all possible other
+            // values, as they will all indicate a 14-byte Ethernet frame header 
+            _ => EtherType::NotVlanTagged,
         }
     }
 }
@@ -565,12 +608,21 @@ mod tests {
         path::Path,
     };
 
-    fn ethernet_trame() -> Vec<u8> {
+    fn ethernet_frame() -> Vec<u8> {
         vec![
             51, 51, 255, 96, 226, 40, 112, 252, 143, 147, 10, 214, 134, 221, 69, 0, 0, 61, 92, 138,
             64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0, 53, 0, 41, 52, 13, 201,
             243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104, 117, 98, 98, 108, 111,
             3, 111, 114, 103, 0, 0, 1, 0, 1,
+        ]
+    }
+
+    fn ethernet_frame_vlan_tagged() -> Vec<u8> {
+        vec![
+            51, 51, 255, 96, 226, 40, 112, 252, 143, 147, 10, 214, 129, 0, 0, 100, 8, 0, 
+            69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0,
+            53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104,
+            117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
         ]
     }
 
@@ -1106,15 +1158,58 @@ mod tests {
     }
 
     #[test]
-    fn it_should_identify_accordingly_a_captured_ethernet_trame_depending_on_the_data_link_type() {
+    fn it_should_identify_accordingly_a_captured_ethernet_frame_depending_on_the_data_link_type() {
         let ethernet_dlt = 1;
-        let ethernet_trame = ethernet_trame();
+        let ethernet_frame = ethernet_frame();
 
-        let packet = Packet::new(&ethernet_dlt, &ethernet_trame);
+        let packet = Packet::new(&ethernet_dlt, &ethernet_frame);
         let identified_type = packet.identify();
 
         let expected_type = PacketType::Ethernet;
 
         assert_eq!(identified_type, expected_type);
+    }
+
+    #[test]
+    fn it_should_generate_an_ip_packet_after_identifying_an_ethernet_frame_and_getting_its_payload()
+    {
+        let ethernet_frame = ethernet_frame();
+        let dlt = 1;
+        let packet = Packet::new(&dlt, &ethernet_frame);
+
+        let payload = packet.payload();
+
+        let maybe_ip_packet = IpPacket::new(&payload);
+        assert!(maybe_ip_packet.is_ok());
+        assert_eq!(maybe_ip_packet.unwrap().protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn it_should_generate_an_ip_packet_after_identifying_a_raw_ip_packet_and_getting_its_payload() {
+        let raw_ip_packet = ipv4_packet_bytes(Protocol::Udp).unwrap();
+        let raw_ip_dlts = [12, 101, 228, 229];
+        raw_ip_dlts.iter().for_each(|dlt| {
+            let packet = Packet::new(dlt, &raw_ip_packet);
+
+            let payload = packet.payload();
+
+            let maybe_ip_packet = IpPacket::new(&payload);
+            assert!(maybe_ip_packet.is_ok());
+            assert_eq!(maybe_ip_packet.unwrap().protocol, Protocol::Udp);
+        });
+    }
+
+    #[test]
+    fn it_should_generate_an_ip_packet_after_distinguishing_an_ethernet_frame_and_a_vlan_tagged_ethernet_frame()
+     {
+        let ethernet_frame = ethernet_frame_vlan_tagged();
+        let dlt = 1;
+        let packet = Packet::new(&dlt, &ethernet_frame);
+
+        let payload = packet.payload();
+
+        let maybe_ip_packet = IpPacket::new(&payload);
+        assert!(maybe_ip_packet.is_ok());
+        assert_eq!(maybe_ip_packet.unwrap().protocol, Protocol::Udp);
     }
 }
