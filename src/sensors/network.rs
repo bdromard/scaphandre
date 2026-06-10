@@ -7,6 +7,9 @@ use std::{
 use sysinfo::{IpNetwork, NetworkData};
 
 #[derive(Debug, PartialEq)]
+pub struct OptionsFieldError;
+
+#[derive(Debug, PartialEq)]
 pub enum ParsingError {
     UnparsablePort,
     UnparsableIpAddress,
@@ -64,6 +67,7 @@ impl Packet {
     }
 }
 
+#[derive(Debug)]
 struct IpPacket {
     version: IpVersion,
     protocol: Protocol,
@@ -73,13 +77,27 @@ struct IpPacket {
 }
 
 impl IpPacket {
-    fn new(data: &[u8]) -> Self {
+    fn new(data: &[u8]) -> Result<Self, OptionsFieldError> {
         let version = data[0] >> 4;
         let ip_version = match version {
             4 => IpVersion::Ipv4,
             6 => IpVersion::Ipv6,
             _ => IpVersion::Unknown,
         };
+
+        if ip_version == IpVersion::Ipv4 {
+            // Internet Header Length in IPv4 packet is either 5 or more. If it is more than 5, it
+            // means the Options Field is present. Due to security concerns with IPv4 options,
+            // there are few use cases for the Options field for applications across networks,
+            // therefore we are ignoring this kind of packet here for now.
+            let ihl = data[0] & 0xF;
+
+            let is_options_field_present = !matches!(ihl, 5);
+
+            if is_options_field_present {
+                return Err(OptionsFieldError);
+            }
+        }
 
         let protocol_as_bytes = match ip_version {
             IpVersion::Ipv4 => Some(data[9]),
@@ -129,13 +147,13 @@ impl IpPacket {
             _ => None,
         };
 
-        IpPacket {
+        Ok(IpPacket {
             version: ip_version,
             protocol,
             source_ip: source_ip.expect("It should contain an IP address"),
             destination_ip: destination_ip.expect("It should contain an IP address"),
             data: data.to_vec(),
-        }
+        })
     }
 }
 
@@ -589,6 +607,14 @@ mod tests {
         Ok(packet?)
     }
 
+    fn ipv4_with_options() -> Vec<u8> {
+        vec![
+            70, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0,
+            53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104,
+            117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+        ]
+    }
+
     fn ipv6_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
         let packet = match protocol {
             Protocol::Udp => Ok(vec![
@@ -809,7 +835,7 @@ mod tests {
     fn it_should_identify_an_ipv4_packet() {
         let packet = ipv4_packet_bytes(Protocol::Udp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(parsed_packet.version, IpVersion::Ipv4);
     }
@@ -818,7 +844,7 @@ mod tests {
     fn it_should_identify_an_ipv6_packet() {
         let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(parsed_packet.version, IpVersion::Ipv6);
     }
@@ -827,7 +853,7 @@ mod tests {
     fn it_should_identify_the_udp_protocol_for_an_ip_packet() {
         let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(parsed_packet.protocol, Protocol::Udp);
     }
@@ -836,7 +862,7 @@ mod tests {
     fn it_should_identify_the_tcp_protocol_for_an_ip_packet() {
         let packet = ipv6_packet_bytes(Protocol::Tcp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(parsed_packet.protocol, Protocol::Tcp);
     }
@@ -845,7 +871,7 @@ mod tests {
     fn it_should_identify_the_source_and_destination_addresses_for_an_ipv4_packet() {
         let packet = ipv4_packet_bytes(Protocol::Tcp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(parsed_packet.source_ip, Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(parsed_packet.destination_ip, Ipv4Addr::new(8, 8, 8, 8));
@@ -855,7 +881,7 @@ mod tests {
     fn it_should_identify_the_source_and_destination_addresses_for_an_ipv6_packet() {
         let packet = ipv6_packet_bytes(Protocol::Udp).unwrap();
 
-        let parsed_packet = IpPacket::new(&packet);
+        let parsed_packet = IpPacket::new(&packet).unwrap();
 
         assert_eq!(
             parsed_packet.source_ip,
@@ -865,6 +891,16 @@ mod tests {
             parsed_packet.destination_ip,
             Ipv6Addr::new(2001, 4860, 4860, 0, 0, 0, 0, 8888)
         );
+    }
+
+    #[test]
+    fn it_should_not_generate_an_ip_packet_if_the_options_field_is_present() {
+        let packet = ipv4_with_options();
+
+        let maybe_ip_packet = IpPacket::new(&packet);
+
+        assert!(maybe_ip_packet.is_err());
+        assert_eq!(maybe_ip_packet.unwrap_err(), OptionsFieldError)
     }
 
     #[test]
