@@ -7,7 +7,10 @@ use std::{
 use sysinfo::{IpNetwork, NetworkData};
 
 #[derive(Debug, PartialEq)]
-pub struct OptionsFieldError;
+pub enum PacketError {
+    OptionsFieldError,
+    FilteredPacket,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum ParsingError {
@@ -104,7 +107,7 @@ impl Packet {
             // 0x8100 indicates VLAN-tagging, and therefore a 18-byte Ethernet frame header
             33024 => EtherType::VlanTagged,
             // For the moment, we do not have to pay too much attention to all possible other
-            // values, as they will all indicate a 14-byte Ethernet frame header 
+            // values, as they will all indicate a 14-byte Ethernet frame header
             _ => EtherType::NotVlanTagged,
         }
     }
@@ -120,7 +123,7 @@ struct IpPacket {
 }
 
 impl IpPacket {
-    fn new(data: &[u8]) -> Result<Self, OptionsFieldError> {
+    fn new(data: &[u8]) -> Result<Self, PacketError> {
         let version = data[0] >> 4;
         let ip_version = match version {
             4 => IpVersion::Ipv4,
@@ -138,7 +141,7 @@ impl IpPacket {
             let is_options_field_present = !matches!(ihl, 5);
 
             if is_options_field_present {
-                return Err(OptionsFieldError);
+                return Err(PacketError::OptionsFieldError);
             }
         }
 
@@ -215,14 +218,18 @@ pub struct TransportLayerPacket {
 }
 
 impl TransportLayerPacket {
-    fn new(ip_packet: &IpPacket) -> Self {
+    fn new(ip_packet: &IpPacket) -> Result<Self, PacketError> {
         let protocol = &ip_packet.protocol;
+
+        if *protocol == Protocol::Unknown {
+            return Err(PacketError::FilteredPacket);
+        }
 
         let source_ip = &ip_packet.source_ip;
         let destination_ip = &ip_packet.destination_ip;
 
         let packet = &ip_packet.data[20..];
-        TransportLayerPacket {
+        Ok(TransportLayerPacket {
             protocol: protocol.to_owned(),
             source_ip: source_ip.to_owned(),
             destination_ip: destination_ip.to_owned(),
@@ -230,7 +237,7 @@ impl TransportLayerPacket {
             destination_address: None,
             size: packet.len() as u64,
             data: packet.to_owned(),
-        }
+        })
     }
 
     // UDP and TCP packets contain both ports in their header in the same location.
@@ -619,21 +626,21 @@ mod tests {
 
     fn ethernet_frame_vlan_tagged() -> Vec<u8> {
         vec![
-            51, 51, 255, 96, 226, 40, 112, 252, 143, 147, 10, 214, 129, 0, 0, 100, 8, 0, 
-            69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0,
-            53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104,
-            117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+            51, 51, 255, 96, 226, 40, 112, 252, 143, 147, 10, 214, 129, 0, 0, 100, 8, 0, 69, 0, 0,
+            61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0, 53, 0, 41,
+            52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6, 104, 117, 98,
+            98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
         ]
     }
 
-    fn ipv4_packet_bytes(protocol: Protocol) -> Result<Vec<u8>, Box<dyn Error>> {
-        let packet = match protocol {
-            Protocol::Udp => Ok(vec![
+    fn ipv4_packet_bytes(protocol: Protocol) -> Vec<u8> {
+        match protocol {
+            Protocol::Udp => vec![
                 69, 0, 0, 61, 92, 138, 64, 0, 64, 17, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208,
                 0, 53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116,
                 6, 104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
-            ]),
-            Protocol::Tcp => Ok(vec![
+            ],
+            Protocol::Tcp => vec![
                 69, 0, 1, 72, 233, 36, 64, 0, 64, 6, 67, 142, 127, 0, 0, 1, 8, 8, 8, 8, 208, 234,
                 1, 187, 247, 89, 28, 109, 222, 186, 190, 253, 128, 24, 95, 247, 14, 56, 0, 0, 1, 1,
                 8, 10, 211, 48, 238, 16, 146, 224, 159, 152, 23, 3, 3, 1, 15, 36, 159, 112, 182, 7,
@@ -652,11 +659,13 @@ mod tests {
                 209, 94, 142, 220, 36, 87, 170, 78, 85, 128, 65, 123, 126, 151, 67, 224, 212, 4,
                 158, 39, 40, 15, 69, 103, 39, 236, 187, 8, 227, 36, 118, 118, 36, 31, 12, 52, 71,
                 250, 104, 6, 243, 193, 22, 59, 195, 222, 75, 218, 6,
-            ]),
-            Protocol::Unknown => Err("Not an acknowledgable protocol"),
-        };
-
-        Ok(packet?)
+            ],
+            Protocol::Unknown => vec![
+                69, 0, 0, 61, 92, 138, 64, 0, 64, 1, 170, 127, 0, 0, 1, 8, 8, 8, 8, 1, 144, 208, 0,
+                53, 0, 41, 52, 13, 201, 243, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 99, 104, 97, 116, 6,
+                104, 117, 98, 98, 108, 111, 3, 111, 114, 103, 0, 0, 1, 0, 1,
+            ],
+        }
     }
 
     fn ipv4_with_options() -> Vec<u8> {
@@ -691,7 +700,7 @@ mod tests {
             protocol: Protocol::Tcp,
             source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            data: ipv4_packet_bytes(Protocol::Tcp).unwrap(),
+            data: ipv4_packet_bytes(Protocol::Tcp),
         }
     }
 
@@ -701,7 +710,7 @@ mod tests {
             protocol: Protocol::Udp,
             source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             destination_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            data: ipv4_packet_bytes(Protocol::Udp).unwrap(),
+            data: ipv4_packet_bytes(Protocol::Udp),
         }
     }
 
@@ -885,7 +894,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_an_ipv4_packet() {
-        let packet = ipv4_packet_bytes(Protocol::Udp).unwrap();
+        let packet = ipv4_packet_bytes(Protocol::Udp);
 
         let parsed_packet = IpPacket::new(&packet).unwrap();
 
@@ -921,7 +930,7 @@ mod tests {
 
     #[test]
     fn it_should_identify_the_source_and_destination_addresses_for_an_ipv4_packet() {
-        let packet = ipv4_packet_bytes(Protocol::Tcp).unwrap();
+        let packet = ipv4_packet_bytes(Protocol::Tcp);
 
         let parsed_packet = IpPacket::new(&packet).unwrap();
 
@@ -952,13 +961,13 @@ mod tests {
         let maybe_ip_packet = IpPacket::new(&packet);
 
         assert!(maybe_ip_packet.is_err());
-        assert_eq!(maybe_ip_packet.unwrap_err(), OptionsFieldError)
+        assert_eq!(maybe_ip_packet.unwrap_err(), PacketError::OptionsFieldError)
     }
 
     #[test]
     fn it_should_generate_a_tcp_packet_when_the_correct_protocol_has_been_identified() {
         let ip_packet = ipv4_packet_tcp();
-        let tcp_packet = TransportLayerPacket::new(&ip_packet);
+        let tcp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         assert_eq!(tcp_packet.protocol, Protocol::Tcp);
     }
@@ -967,7 +976,7 @@ mod tests {
     fn it_should_parse_a_tcp_packet_to_get_the_relevant_information() {
         let ip_packet = ipv4_packet_tcp();
 
-        let mut tcp_packet = TransportLayerPacket::new(&ip_packet);
+        let mut tcp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         tcp_packet.parse();
 
@@ -985,7 +994,7 @@ mod tests {
     #[test]
     fn it_should_identify_the_application_packet_size_from_a_tcp_packet() {
         let ip_packet = ipv4_packet_tcp();
-        let tcp_packet = TransportLayerPacket::new(&ip_packet);
+        let tcp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         let expected_size = ((tcp_packet.data.len() * 8) - 256) as u32;
         let identified_size = identify_app_packet_size(&tcp_packet.data, Protocol::Tcp);
@@ -996,16 +1005,31 @@ mod tests {
     #[test]
     fn it_should_generate_an_udp_packet_when_the_correct_protocol_has_been_identified() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = TransportLayerPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         assert_eq!(udp_packet.protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn it_should_not_generate_a_transport_layer_packet_if_an_unmanaged_protocol_has_been_identified()
+     {
+        let data = ipv4_packet_bytes(Protocol::Unknown);
+        let ip_packet = IpPacket::new(&data).unwrap();
+
+        let maybe_transport_packet = TransportLayerPacket::new(&ip_packet);
+
+        assert!(maybe_transport_packet.is_err());
+        assert_eq!(
+            maybe_transport_packet.unwrap_err(),
+            PacketError::FilteredPacket
+        );
     }
 
     #[test]
     fn it_should_parse_a_udp_packet_to_get_the_relevant_information() {
         let ip_packet = ipv4_packet_udp();
 
-        let mut udp_packet = TransportLayerPacket::new(&ip_packet);
+        let mut udp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         udp_packet.parse();
 
@@ -1025,7 +1049,7 @@ mod tests {
     #[test]
     fn it_should_identify_the_application_packet_size_from_a_udp_packet() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = TransportLayerPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         let expected_size = ((udp_packet.data.len() * 8) - 16) as u32;
         let identified_size = identify_app_packet_size(&udp_packet.data, Protocol::Udp);
@@ -1036,7 +1060,7 @@ mod tests {
     #[test]
     fn it_should_identify_if_a_packet_is_outgoing() {
         let ip_packet = ipv4_packet_udp();
-        let udp_packet = TransportLayerPacket::new(&ip_packet);
+        let udp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
@@ -1063,7 +1087,7 @@ mod tests {
             destination_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             data,
         };
-        let incoming_udp_packet = TransportLayerPacket::new(&ip_packet);
+        let incoming_udp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
 
         let local_ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
 
@@ -1104,7 +1128,7 @@ mod tests {
     fn it_should_estimate_the_packets_total_size_for_a_socket() {
         let mut socket = outgoing_socket();
         let ip_packet = ipv4_packet_tcp();
-        let tcp_packet = TransportLayerPacket::new(&ip_packet);
+        let tcp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
         let tcp_packets = vec![tcp_packet.clone(), tcp_packet.clone()];
 
         socket.packets = Some(tcp_packets);
@@ -1186,7 +1210,7 @@ mod tests {
 
     #[test]
     fn it_should_generate_an_ip_packet_after_identifying_a_raw_ip_packet_and_getting_its_payload() {
-        let raw_ip_packet = ipv4_packet_bytes(Protocol::Udp).unwrap();
+        let raw_ip_packet = ipv4_packet_bytes(Protocol::Udp);
         let raw_ip_dlts = [12, 101, 228, 229];
         raw_ip_dlts.iter().for_each(|dlt| {
             let packet = Packet::new(dlt, &raw_ip_packet);
