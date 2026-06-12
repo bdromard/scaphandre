@@ -7,6 +7,11 @@ use std::{
 use pcap::{Active, Capture, Device};
 use sysinfo::{IpNetwork, NetworkData};
 
+const TCP_SOCKETS_FILE: &str = "/proc/net/tcp";
+const TCP6_SOCKETS_FILE: &str = "/proc/net/tcp6";
+const UDP_SOCKETS_FILE: &str = "/proc/net/udp";
+const UDP6_SOCKETS_FILE: &str = "/proc/net/udp6";
+
 #[derive(Debug, PartialEq)]
 pub enum PacketError {
     OptionsFieldError,
@@ -204,7 +209,7 @@ impl IpPacket {
     }
 }
 
-/// This structure represents either a TCP or UDP packet. For the relevant data needed to estimate
+/// This structure represents either a TCP or UDP packet. For the relevant data needed to estimate,
 /// the outgoing or incoming traffic per process, the packet parsing logic is the same. Depending
 /// on future needs, this might evolve to a trait with a different parsing logic for each protocol.
 #[derive(Clone, Debug, PartialEq)]
@@ -259,7 +264,7 @@ impl TransportLayerPacket {
 /// This structure contains either a TCP(6) or UDP(6) listening socket, as parsed from the
 /// /proc/net/tcp(6) or /proc/net(6) files. It is meant to be allocated to a specific network
 /// interface.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Socket {
     inode: i32,
     process_name: Option<String>,
@@ -270,7 +275,7 @@ pub struct Socket {
     source_port: Option<u32>,
     destination_port: Option<u32>,
     direction: Option<Direction>,
-    packets: Option<Vec<TransportLayerPacket>>,
+    packets: Vec<TransportLayerPacket>,
     app_packets_size: Option<u64>,
 }
 
@@ -292,7 +297,7 @@ impl Socket {
             source_port: Some(source_port),
             destination_port: Some(destination_port),
             direction: None,
-            packets: None,
+            packets: vec![],
             app_packets_size: None,
         }
     }
@@ -315,6 +320,20 @@ impl Socket {
         }
     }
 
+    fn filter_packet(&mut self, packet: &IpPacket) {
+        if packet.source_ip == self.source_ip.unwrap()
+            && packet.destination_ip == self.destination_ip.unwrap()
+        {
+            let maybe_transport_packet = TransportLayerPacket::new(packet);
+            match maybe_transport_packet {
+                Ok(packet) => self.packets.push(packet),
+                Err(packet_error) => {
+                    eprintln!("Unhandled protocol! The packet has been filtered: {packet_error:?}")
+                }
+            }
+        }
+    }
+
     fn set_direction(&mut self, local_ips: &[IpAddr]) {
         let source_ip = self.source_ip.unwrap();
         let destination_ip = self.destination_ip.unwrap();
@@ -327,7 +346,6 @@ impl Socket {
         let total_size = self
             .packets
             .clone()
-            .unwrap()
             .iter()
             .map(|packet| {
                 let size = identify_app_packet_size(&packet.data, self.protocol.clone().unwrap());
@@ -336,30 +354,18 @@ impl Socket {
             .sum();
         self.app_packets_size = Some(total_size);
     }
-
-    fn filter_packets(&mut self, packets: &[IpPacket]) {
-        let socket_packets: Vec<TransportLayerPacket> = packets
-            .iter()
-            .filter(|packet| {
-                packet.source_ip == self.source_ip.unwrap()
-                    && packet.destination_ip == self.destination_ip.unwrap()
-            })
-            .map(|packet| TransportLayerPacket::new(packet).unwrap())
-            .collect();
-
-        self.packets = Some(socket_packets);
-    }
 }
 
 /// This structure contains the relevant information for a network interface (wired, wireless...).
 /// It holds the sockets through which a connection is established, and these sockets are meant to
 /// be continually updated at runtime.
-struct NetworkInterface {
+///
+pub struct NetworkInterface {
     name: String,
     total_received_bytes: u64,
     total_transmitted_bytes: u64,
     ip_networks: Vec<IpNetwork>,
-    sockets: Option<Vec<Socket>>,
+    sockets: Vec<Socket>,
     packet_capture: Option<Capture<Active>>,
 }
 
@@ -370,12 +376,12 @@ impl NetworkInterface {
             total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
             total_received_bytes: sysinfo_interface.1.total_received(),
             ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
-            sockets: None,
+            sockets: vec![],
             packet_capture: None,
         }
     }
 
-    fn identify_sockets(&mut self, sockets_file: PathBuf) {
+    fn identify_sockets(&mut self, sockets_file: &Path) {
         let local_ips: Vec<IpAddr> = self
             .ip_networks
             .iter()
@@ -389,7 +395,7 @@ impl NetworkInterface {
 
         // Checking that the source IP address is among the identified IP adresses linked
         // to a network interface. If so, create a socket for this network interface.
-        let sockets = sockets_lines[1..]
+        let sockets: Vec<Socket> = sockets_lines[1..]
             .iter()
             .filter(|line| {
                 let formatted_line = line.trim().split(" ").collect::<Vec<&str>>();
@@ -427,7 +433,7 @@ impl NetworkInterface {
             })
             .collect();
 
-        self.sockets = Some(sockets);
+        sockets.iter().for_each(|s| self.sockets.push(s.clone()));
     }
 
     pub fn capture_packets(&mut self) {
@@ -787,7 +793,7 @@ mod tests {
             source_port: Some(123),
             destination_port: Some(456),
             direction: Some(Direction::Outgoing),
-            packets: None,
+            packets: vec![],
             app_packets_size: None,
         }
     }
@@ -803,7 +809,7 @@ mod tests {
             source_port: Some(123),
             destination_port: Some(456),
             direction: None,
-            packets: None,
+            packets: vec![],
             app_packets_size: None,
         }
     }
@@ -873,6 +879,7 @@ mod tests {
     fn it_should_identify_the_sockets_linked_to_a_network_interface() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let tcp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/tcp");
+        let path = tcp_sockets_fixture.as_path();
 
         let ip_network = IpNetwork {
             addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -884,15 +891,15 @@ mod tests {
             total_transmitted_bytes: 0,
             total_received_bytes: 0,
             ip_networks,
-            sockets: None,
+            sockets: vec![],
             packet_capture: None,
         };
 
-        network_interface.identify_sockets(tcp_sockets_fixture);
+        network_interface.identify_sockets(path);
 
         let expected_destination_ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 
-        let network_sockets = network_interface.sockets.unwrap();
+        let network_sockets = network_interface.sockets;
 
         assert_eq!(network_sockets[0].source_ip, Some(ip_network.addr));
         assert_eq!(
@@ -1194,7 +1201,7 @@ mod tests {
         let tcp_packet = TransportLayerPacket::new(&ip_packet).unwrap();
         let tcp_packets = vec![tcp_packet.clone(), tcp_packet.clone()];
 
-        socket.packets = Some(tcp_packets);
+        socket.packets = tcp_packets;
         socket.evaluate_packets_size();
 
         let expected_size = (((tcp_packet.data.len() * 8) - 256) * 2) as u64;
@@ -1218,7 +1225,7 @@ mod tests {
             source_port: Some(123),
             destination_port: Some(456),
             direction: Some(Direction::Outgoing),
-            packets: None,
+            packets: vec![],
             app_packets_size: Some(1024),
         };
 
@@ -1232,7 +1239,7 @@ mod tests {
             source_port: Some(123),
             destination_port: Some(456),
             direction: Some(Direction::Incoming),
-            packets: None,
+            packets: vec![],
             app_packets_size: Some(2056),
         };
 
@@ -1310,8 +1317,10 @@ mod tests {
             ipv4_packet_tcp_incoming(),
         ];
 
-        socket.filter_packets(&packets);
+        packets.iter().for_each(|packet| {
+            socket.filter_packet(packet);
+        });
 
-        assert_eq!(socket.packets.unwrap().len(), 2);
+        assert_eq!(socket.packets.len(), 2);
     }
 }
