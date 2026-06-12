@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use pcap::{Active, Capture, Device};
 use sysinfo::{IpNetwork, NetworkData};
 
 #[derive(Debug, PartialEq)]
@@ -335,6 +336,19 @@ impl Socket {
             .sum();
         self.app_packets_size = Some(total_size);
     }
+
+    fn filter_packets(&mut self, packets: &[IpPacket]) {
+        let socket_packets: Vec<TransportLayerPacket> = packets
+            .iter()
+            .filter(|packet| {
+                packet.source_ip == self.source_ip.unwrap()
+                    && packet.destination_ip == self.destination_ip.unwrap()
+            })
+            .map(|packet| TransportLayerPacket::new(packet).unwrap())
+            .collect();
+
+        self.packets = Some(socket_packets);
+    }
 }
 
 /// This structure contains the relevant information for a network interface (wired, wireless...).
@@ -346,6 +360,7 @@ struct NetworkInterface {
     total_transmitted_bytes: u64,
     ip_networks: Vec<IpNetwork>,
     sockets: Option<Vec<Socket>>,
+    packet_capture: Option<Capture<Active>>,
 }
 
 impl NetworkInterface {
@@ -356,6 +371,7 @@ impl NetworkInterface {
             total_received_bytes: sysinfo_interface.1.total_received(),
             ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
             sockets: None,
+            packet_capture: None,
         }
     }
 
@@ -412,6 +428,23 @@ impl NetworkInterface {
             .collect();
 
         self.sockets = Some(sockets);
+    }
+
+    pub fn capture_packets(&mut self) {
+        let interface_name = &self.name;
+        let devices = Device::list().unwrap();
+
+        let pcap_device = devices
+            .iter()
+            .filter(|dev| dev.name == *interface_name)
+            .collect::<Vec<&Device>>()[0];
+
+        let capture = Capture::from_device(pcap_device.to_owned())
+            .expect("It should allow capturing packets from network device.")
+            .open()
+            .expect("It should open the capture handle.");
+
+        self.packet_capture = Some(capture);
     }
 }
 
@@ -714,6 +747,35 @@ mod tests {
         }
     }
 
+    fn ipv4_packet_tcp_incoming() -> IpPacket {
+        let data = vec![
+            69, 0, 1, 72, 233, 36, 64, 0, 64, 6, 67, 142, 8, 8, 8, 8, 127, 0, 0, 1, 208, 234, 1,
+            187, 247, 89, 28, 109, 222, 186, 190, 253, 128, 24, 95, 247, 14, 56, 0, 0, 1, 1, 8, 10,
+            211, 48, 238, 16, 146, 224, 159, 152, 23, 3, 3, 1, 15, 36, 159, 112, 182, 7, 26, 40,
+            78, 203, 40, 151, 146, 172, 45, 76, 156, 222, 103, 188, 89, 211, 164, 138, 175, 127,
+            39, 183, 159, 3, 239, 194, 49, 100, 17, 178, 149, 0, 116, 121, 15, 15, 97, 213, 232,
+            88, 73, 50, 243, 176, 251, 229, 143, 227, 108, 207, 30, 30, 160, 237, 133, 132, 80,
+            177, 238, 32, 19, 16, 204, 111, 159, 130, 171, 81, 98, 216, 128, 206, 155, 146, 206,
+            157, 112, 216, 70, 170, 66, 246, 171, 12, 234, 161, 177, 53, 78, 180, 237, 128, 128,
+            210, 177, 76, 248, 183, 37, 218, 30, 188, 99, 190, 113, 13, 94, 29, 109, 206, 38, 7,
+            119, 107, 62, 125, 60, 145, 96, 64, 144, 101, 104, 132, 67, 170, 243, 236, 37, 115, 40,
+            24, 170, 103, 24, 113, 24, 228, 211, 39, 155, 211, 63, 173, 179, 112, 31, 143, 168,
+            166, 122, 117, 12, 95, 7, 4, 33, 25, 192, 143, 249, 1, 18, 230, 163, 115, 224, 33, 169,
+            39, 52, 70, 212, 46, 212, 5, 30, 147, 102, 164, 154, 107, 170, 9, 93, 105, 219, 10,
+            199, 180, 59, 181, 76, 249, 228, 111, 253, 253, 246, 246, 37, 49, 188, 30, 69, 99, 3,
+            178, 0, 241, 6, 157, 173, 19, 140, 49, 47, 209, 94, 142, 220, 36, 87, 170, 78, 85, 128,
+            65, 123, 126, 151, 67, 224, 212, 4, 158, 39, 40, 15, 69, 103, 39, 236, 187, 8, 227, 36,
+            118, 118, 36, 31, 12, 52, 71, 250, 104, 6, 243, 193, 22, 59, 195, 222, 75, 218, 6,
+        ];
+        IpPacket {
+            version: IpVersion::Ipv4,
+            protocol: Protocol::Tcp,
+            destination_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            source_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            data,
+        }
+    }
+
     fn outgoing_socket() -> Socket {
         Socket {
             inode: 123,
@@ -823,6 +885,7 @@ mod tests {
             total_received_bytes: 0,
             ip_networks,
             sockets: None,
+            packet_capture: None,
         };
 
         network_interface.identify_sockets(tcp_sockets_fixture);
@@ -1235,5 +1298,20 @@ mod tests {
         let maybe_ip_packet = IpPacket::new(&payload);
         assert!(maybe_ip_packet.is_ok());
         assert_eq!(maybe_ip_packet.unwrap().protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn it_should_filter_packets_received_by_a_socket_to_only_keep_those_related_to_this_socket() {
+        let mut socket = outgoing_socket();
+
+        let packets: Vec<IpPacket> = vec![
+            ipv4_packet_tcp(),
+            ipv4_packet_tcp(),
+            ipv4_packet_tcp_incoming(),
+        ];
+
+        socket.filter_packets(&packets);
+
+        assert_eq!(socket.packets.unwrap().len(), 2);
     }
 }
