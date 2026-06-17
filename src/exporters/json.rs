@@ -711,6 +711,7 @@ mod tests {
             _sensor_data: mock_sensor_data,
             proc_tracker,
             disks: vec![first_disk, second_disk],
+            network_interfaces: vec![],
         }
     }
 

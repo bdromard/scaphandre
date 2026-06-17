@@ -1,16 +1,36 @@
 use std::{
+    fmt::{Debug, Display, Formatter},
     fs::read_to_string,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
-use pcap::{Active, Capture, Device};
+use pcap::{Active, Capture, ConnectionStatus};
 use sysinfo::{IpNetwork, NetworkData};
 
 const TCP_SOCKETS_FILE: &str = "/proc/net/tcp";
 const TCP6_SOCKETS_FILE: &str = "/proc/net/tcp6";
 const UDP_SOCKETS_FILE: &str = "/proc/net/udp";
 const UDP6_SOCKETS_FILE: &str = "/proc/net/udp6";
+
+#[derive(Debug, PartialEq)]
+pub enum NetworkError {
+    UnconnectableDevice,
+    NetworkInterfaceAlreadyPresent,
+}
+
+impl Display for NetworkError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            NetworkError::UnconnectableDevice => {
+                write!(f, "The identified device is not connectable!")
+            }
+            NetworkError::NetworkInterfaceAlreadyPresent => {
+                write!(f, "Network interface is already present in topology.")
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum PacketError {
@@ -58,6 +78,7 @@ pub enum EtherType {
     NotVlanTagged,
 }
 
+#[derive(Clone)]
 struct Packet {
     datalink_type: i32,
     data: Vec<u8>,
@@ -359,25 +380,43 @@ impl Socket {
 /// This structure contains the relevant information for a network interface (wired, wireless...).
 /// It holds the sockets through which a connection is established, and these sockets are meant to
 /// be continually updated at runtime.
-///
+#[derive(Clone)]
 pub struct NetworkInterface {
-    name: String,
-    total_received_bytes: u64,
+    pub name: String,
+    pub total_received_bytes: u64,
     total_transmitted_bytes: u64,
     ip_networks: Vec<IpNetwork>,
     sockets: Vec<Socket>,
-    packet_capture: Option<Capture<Active>>,
+    packets: Vec<Packet>,
+}
+
+impl Debug for NetworkInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkInterface")
+            .field("name", &self.name)
+            .field("sockets", &self.sockets)
+            .field("total_received_bytes", &self.total_received_bytes)
+            .field("total_transmitted_bytes", &self.total_transmitted_bytes)
+            .field("ip_networks", &self.ip_networks)
+            .finish()
+    }
 }
 
 impl NetworkInterface {
-    fn new(sysinfo_interface: (&String, &NetworkData)) -> Self {
-        NetworkInterface {
-            name: sysinfo_interface.0.to_owned(),
-            total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
-            total_received_bytes: sysinfo_interface.1.total_received(),
-            ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
-            sockets: vec![],
-            packet_capture: None,
+    pub fn new(
+        sysinfo_interface: (&String, &NetworkData),
+        connection_status: &ConnectionStatus,
+    ) -> Result<Self, NetworkError> {
+        match connection_status {
+            ConnectionStatus::Connected | ConnectionStatus::Disconnected => Ok(NetworkInterface {
+                name: sysinfo_interface.0.to_owned(),
+                total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
+                total_received_bytes: sysinfo_interface.1.total_received(),
+                ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
+                sockets: vec![],
+                packets: vec![],
+            }),
+            _ => Err(NetworkError::UnconnectableDevice),
         }
     }
 
@@ -436,21 +475,14 @@ impl NetworkInterface {
         sockets.iter().for_each(|s| self.sockets.push(s.clone()));
     }
 
-    pub fn capture_packets(&mut self) {
-        let interface_name = &self.name;
-        let devices = Device::list().unwrap();
+    pub fn capture_packet(&mut self, mut capture: Capture<Active>) {
+        let dtl = capture.get_datalink().0;
 
-        let pcap_device = devices
-            .iter()
-            .filter(|dev| dev.name == *interface_name)
-            .collect::<Vec<&Device>>()[0];
+        let captured_packet = capture.next_packet().unwrap();
 
-        let capture = Capture::from_device(pcap_device.to_owned())
-            .expect("It should allow capturing packets from network device.")
-            .open()
-            .expect("It should open the capture handle.");
+        let packet = Packet::new(&dtl, captured_packet.data);
 
-        self.packet_capture = Some(capture);
+        self.packets.push(packet);
     }
 }
 
@@ -827,9 +859,10 @@ mod tests {
     #[test]
     fn it_should_create_a_new_network_interface_from_sysinfo() {
         let network_interfaces = sysinfo::Networks::new_with_refreshed_list();
+        let connection_status = ConnectionStatus::Connected;
 
         network_interfaces.iter().for_each(|interface| {
-            let scaph_net_interface = NetworkInterface::new(interface);
+            let scaph_net_interface = NetworkInterface::new(interface, &connection_status).unwrap();
 
             assert_eq!(&scaph_net_interface.name, interface.0);
             assert_eq!(
@@ -841,6 +874,24 @@ mod tests {
                 interface.1.total_transmitted()
             );
             assert_eq!(&scaph_net_interface.ip_networks, interface.1.ip_networks())
+        });
+    }
+
+    #[test]
+    fn it_should_not_create_a_net_network_interface_is_the_identified_device_is_not_connectable() {
+        let network_interfaces = sysinfo::Networks::new_with_refreshed_list();
+
+        let connection_statuses = [ConnectionStatus::Unknown, ConnectionStatus::NotApplicable];
+
+        connection_statuses.iter().for_each(|status| {
+            network_interfaces.iter().for_each(|interface| {
+                let try_creating_scaph_net_interface =
+                    NetworkInterface::new(interface, status).err();
+                assert_eq!(
+                    try_creating_scaph_net_interface,
+                    Some(NetworkError::UnconnectableDevice)
+                );
+            });
         });
     }
 
@@ -892,7 +943,7 @@ mod tests {
             total_received_bytes: 0,
             ip_networks,
             sockets: vec![],
-            packet_capture: None,
+            packets: vec![],
         };
 
         network_interface.identify_sockets(path);

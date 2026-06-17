@@ -210,6 +210,24 @@ impl StdoutExporter {
             }
         }
 
+        let network_metrics: Vec<&Metric> = metrics
+            .iter()
+            .filter(|metric| metric.name == "scaph_net_interface_total_rx")
+            .collect();
+
+        if network_metrics.is_empty() {
+            println!("No available network interface yet!")
+        } else {
+            network_metrics.iter().for_each(|metric| {
+                let total_rx = metric.metric_value.to_string();
+                let net_interface_name = metric.attributes.get("net_interface_name").unwrap();
+
+                println!("{}: {} bytes", net_interface_name, total_rx);
+            });
+
+            println!("\n");
+        }
+
         let consumers: Vec<(IProcess, f64)>;
         if let Some(regex) = &self.args.regex_filter {
             println!("Processes filtered by '{regex}':");

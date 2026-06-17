@@ -17,8 +17,8 @@ pub mod utils;
 #[cfg(feature = "warpten")]
 pub mod warpten;
 use crate::sensors::{
-    utils::{current_system_time_since_epoch, IProcess},
     RecordGenerator, RecordReader, Topology,
+    utils::{IProcess, current_system_time_since_epoch},
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -437,6 +437,27 @@ impl MetricGenerator {
             }
         }
 
+        self.topology
+            .network_interfaces
+            .iter()
+            .for_each(|net_interface| {
+                let mut attributes = HashMap::new();
+                attributes.insert(String::from("net_interface_name"), net_interface.name.clone());
+                let network_metric = Metric {
+                    name: String::from("scaph_net_interface_total_rx"),
+                    metric_type: String::from("gauge"),
+                    ttl: 60.0,
+                    timestamp: default_timestamp,
+                    hostname: self.hostname.clone(),
+                    state: String::from("ok"),
+                    tags: vec![String::from("scaphandre")],
+                    attributes: attributes.clone(),
+                    description: String::from("Total received bytes for this network interface"),
+                    metric_value: MetricValueType::IntUnsigned(net_interface.total_received_bytes)
+                };
+                self.data.push(network_metric);
+            });
+
         #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
         {
             self.topology.disks.iter().for_each(|topology_disk| {
@@ -585,10 +606,7 @@ impl MetricGenerator {
                     String::from("disk_is_removable"),
                     disk.attributes.removable.clone(),
                 );
-                attributes.insert(
-                    String::from("disk_type"),
-                    disk.attributes.kind.clone(),
-                );
+                attributes.insert(String::from("disk_type"), disk.attributes.kind.clone());
 
                 let metric = Metric {
                     name: metric.name,
@@ -607,6 +625,8 @@ impl MetricGenerator {
                 self.data.push(metric);
             })
         }
+
+        self.topology.get_network_interfaces();
 
         let ram_attributes = HashMap::new();
         let metric_value = self.topology.get_total_memory_bytes();
@@ -1137,10 +1157,10 @@ impl MetricGenerator {
 mod tests {
     use super::*;
     use crate::sensors::{
-        disk::{EvaluatedDisk, DiskKindWrapper, DiskPowerSpecs, DiskState, FormFactor},
+        Record, RecordReader,
+        disk::{DiskKindWrapper, DiskPowerSpecs, DiskState, EvaluatedDisk, FormFactor},
         units::Unit,
         utils::ProcessTracker,
-        Record, RecordReader,
     };
 
     fn generate_mock_topology() -> Topology {
@@ -1214,6 +1234,7 @@ mod tests {
             _sensor_data: mock_sensor_data,
             proc_tracker,
             disks: vec![disk.clone(), disk.clone()],
+            network_interfaces: vec![],
         }
     }
 

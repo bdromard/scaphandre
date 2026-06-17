@@ -10,20 +10,27 @@ use msr_rapl::get_msr_value;
 #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
 pub mod disk;
 #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
-use disk::{format_disk_name, generate_power_model, EvaluatedDisk};
+use disk::{EvaluatedDisk, format_disk_name, generate_power_model};
+pub mod network;
 #[cfg(target_os = "linux")]
 pub mod powercap_rapl;
 pub mod units;
 pub mod utils;
-pub mod network;
+use pcap::{ConnectionStatus, Device};
 #[cfg(target_os = "linux")]
 use procfs::{CpuInfo, CpuTime, KernelStats};
 use std::{collections::HashMap, error::Error, fmt, fs, mem::size_of_val, str, time::Duration};
 #[allow(unused_imports)]
 use sysinfo::{DiskKind, Pid, System};
-use utils::{current_system_time_since_epoch, IProcess, ProcessTracker};
+use sysinfo::{NetworkData, Networks};
+use utils::{IProcess, ProcessTracker, current_system_time_since_epoch};
 
-use crate::sensors::disk::{Attributes, DiskMetrics, Metric, Metrics};
+use crate::sensors::{
+    disk::{Attributes, DiskMetrics, Metric, Metrics},
+    network::{
+        NetworkError, NetworkInterface,
+    },
+};
 
 // !!!!!!!!!!!!!!!!! Sensor !!!!!!!!!!!!!!!!!!!!!!!
 /// Sensor trait, the Sensor API.
@@ -69,6 +76,7 @@ pub struct Topology {
     /// Disks with their power consumption evaluated
     #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
     pub disks: Vec<EvaluatedDisk>,
+    pub network_interfaces: Vec<NetworkInterface>,
 }
 
 impl RecordGenerator for Topology {
@@ -158,6 +166,7 @@ impl Topology {
             _sensor_data: sensor_data,
             #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
             disks: vec![],
+            network_interfaces: vec![],
         }
     }
 
@@ -671,11 +680,7 @@ impl Topology {
             };
 
             let total_space = sysinfo_disk.total_space().to_string();
-            let total_bytes_record = Record::new(
-                timestamp,
-                total_space,
-                units::Unit::Bytes,
-            );
+            let total_bytes_record = Record::new(timestamp, total_space, units::Unit::Bytes);
             let total_bytes = Metric {
                 name: String::from("scaph_host_disk_total_bytes"),
                 description: String::from("Total disk size, in bytes."),
@@ -683,7 +688,8 @@ impl Topology {
             };
 
             let available_space = sysinfo_disk.available_space().to_string();
-            let available_bytes_record = Record::new(timestamp, available_space, units::Unit::Bytes);
+            let available_bytes_record =
+                Record::new(timestamp, available_space, units::Unit::Bytes);
             let available_bytes = Metric {
                 name: String::from("scaph_host_disk_available_bytes"),
                 description: String::from("Available disk space, in bytes."),
@@ -755,6 +761,54 @@ impl Topology {
             let written_bytes = usage.written_bytes;
             topology_disk.refresh(read_bytes, written_bytes);
         });
+    }
+
+    pub fn get_network_interfaces(&mut self) -> Vec<NetworkInterface> {
+        let sysinfo_interfaces = Networks::new_with_refreshed_list();
+        let pcap_devices = Device::list().unwrap();
+
+        sysinfo_interfaces.iter().for_each(|sysinfo_interface| {
+            let associated_pcap_device = pcap_devices
+                .iter()
+                .find(|dev| dev.name == *sysinfo_interface.0)
+                .unwrap();
+
+            let connection_status = &associated_pcap_device.flags.connection_status;
+
+            match self.add_network_interface(sysinfo_interface, connection_status) {
+                Ok(_) => info!("Added network interface to topology!"),
+                Err(e) => info!("{:?} {e}", sysinfo_interface.0),
+            }
+
+        });
+
+        self.network_interfaces.clone()
+    }
+
+    pub fn add_network_interface(
+        &mut self,
+        sysinfo_interface: (&String, &NetworkData),
+        connection_status: &ConnectionStatus,
+    ) -> Result<(), NetworkError> {
+        let possible_scaph_net_interface =
+            NetworkInterface::new(sysinfo_interface, connection_status);
+
+        match possible_scaph_net_interface {
+            Ok(interface_to_add) => {
+                let identified_net_interfaces: Vec<&NetworkInterface> = self
+                    .network_interfaces
+                    .iter()
+                    .filter(|scaph_interface| interface_to_add.name == scaph_interface.name)
+                    .collect();
+                if identified_net_interfaces.is_empty() {
+                    self.network_interfaces.push(interface_to_add);
+                    Ok(())
+                } else {
+                    Err(NetworkError::NetworkInterfaceAlreadyPresent)
+                }
+            }
+            Err(_) => Err(NetworkError::UnconnectableDevice),
+        }
     }
 
     pub fn get_total_memory_bytes(&self) -> Record {
@@ -1700,6 +1754,7 @@ mod tests {
             proc_tracker,
             #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
             disks: vec![],
+            network_interfaces: vec![],
         }
     }
 
@@ -1763,6 +1818,14 @@ mod tests {
         let disks = topology.get_disks();
 
         assert_eq!(disks.len(), number_of_disks_from_sysinfo);
+    }
+
+    #[test]
+    fn it_should_associate_all_connectable_network_interfaces_to_the_topology() {
+        let mut topology = generate_mock_topology();
+        let network_interfaces = topology.get_network_interfaces();
+
+        assert!(!network_interfaces.is_empty())
     }
 }
 //  Copyright 2020 The scaphandre authors.
