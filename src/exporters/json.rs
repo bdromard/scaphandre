@@ -148,6 +148,13 @@ struct EvaluatedDisk {
     timestamp: f64,
     consumption: u32,
 }
+#[derive(Debug, Deserialize, Serialize)]
+struct NetworkInterface {
+    name: String,
+    total_received_bytes: u64,
+    total_transmitted_bytes: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Components {
     disks: Option<Vec<Disk>>,
@@ -163,6 +170,7 @@ struct Report {
     host: Host,
     consumers: Vec<Consumer>,
     sockets: Vec<Socket>,
+    network_interfaces: Vec<NetworkInterface>,
     #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
     evaluated_disks: Vec<EvaluatedDisk>,
 }
@@ -354,6 +362,39 @@ impl JsonExporter {
             }
         }
         res
+    }
+
+    fn generate_network_interfaces_report(&mut self, metrics: &[Metric]) -> Vec<NetworkInterface> {
+        let networks_metrics: Vec<&Metric> = metrics
+            .iter()
+            .filter(|metric| metric.name == "scaph_net_interface_total_traffic_bytes")
+            .collect();
+
+        let mut network_interfaces_metrics: Vec<NetworkInterface> = networks_metrics
+            .iter()
+            .map(|metric| {
+                let network_name = metric
+                    .attributes
+                    .get("net_interface_name")
+                    .unwrap()
+                    .to_string();
+
+                let total_traffic = match metric.metric_value {
+                    MetricValueType::Tuple((total_rx, total_tx)) => Some((total_rx, total_tx)),
+                    _ => None,
+                };
+
+                NetworkInterface {
+                    name: network_name,
+                    total_received_bytes: total_traffic.unwrap().0,
+                    total_transmitted_bytes: total_traffic.unwrap().1,
+                }
+            })
+            .collect();
+
+        network_interfaces_metrics.sort_by(|a, b| a.name.cmp(&b.name));
+
+        network_interfaces_metrics
     }
 
     #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
@@ -596,10 +637,12 @@ impl JsonExporter {
             Some(host) => {
                 #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
                 let evaluated_disks = self.generate_evaluated_disks_report(&metrics);
+                let network_interfaces = self.generate_network_interfaces_report(&metrics);
                 let report = Report {
                     host,
                     consumers: top_consumers,
                     sockets: all_sockets,
+                    network_interfaces,
                     #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
                     evaluated_disks,
                 };
@@ -626,10 +669,11 @@ impl JsonExporter {
 mod tests {
     use super::*;
     use crate::sensors::{
-        disk::{EvaluatedDisk, DiskKindWrapper, DiskPowerSpecs, DiskState, FormFactor},
+        Record, Sensor, Topology,
+        disk::{DiskKindWrapper, DiskPowerSpecs, DiskState, EvaluatedDisk, FormFactor},
+        network::NetworkInterface,
         units::Unit,
         utils::ProcessTracker,
-        Record, Sensor, Topology,
     };
     use std::error::Error;
 
@@ -702,6 +746,24 @@ mod tests {
             power_model: None,
         };
 
+        let first_network_interface = NetworkInterface {
+            name: String::from("wlo1"),
+            total_received_bytes: 1024,
+            total_transmitted_bytes: 1024,
+            ip_networks: vec![],
+            sockets: vec![],
+            packets: vec![],
+        };
+
+        let second_network_interface = NetworkInterface {
+            name: String::from("wlo2"),
+            total_received_bytes: 1024,
+            total_transmitted_bytes: 1024,
+            ip_networks: vec![],
+            sockets: vec![],
+            packets: vec![],
+        };
+
         Topology {
             sockets: vec![],
             stat_buffer: vec![],
@@ -711,7 +773,7 @@ mod tests {
             _sensor_data: mock_sensor_data,
             proc_tracker,
             disks: vec![first_disk, second_disk],
-            network_interfaces: vec![],
+            network_interfaces: vec![first_network_interface, second_network_interface],
         }
     }
 
@@ -745,6 +807,21 @@ mod tests {
         assert_eq!(evaluated_disks_report[1].disk_name, String::from("nvme0n2"));
         assert_eq!(evaluated_disks_report[0].consumption, 8000000);
         assert_eq!(evaluated_disks_report[1].consumption, 8000000);
+    }
+    #[test]
+    fn it_should_export_all_evaluated_network_interfaces() {
+        let mut mock_json_exporter = generate_mock_exporter();
+        mock_json_exporter.metric_generator.gen_self_metrics();
+        let metrics = mock_json_exporter.metric_generator.pop_metrics();
+
+        let network_interfaces_reports =
+            mock_json_exporter.generate_network_interfaces_report(&metrics);
+
+        assert_eq!(network_interfaces_reports.len(), 2);
+        assert_eq!(network_interfaces_reports[0].name, String::from("wlo1"));
+        assert_eq!(network_interfaces_reports[1].name, String::from("wlo2"));
+        assert_eq!(network_interfaces_reports[0].total_received_bytes, 1024);
+        assert_eq!(network_interfaces_reports[1].total_received_bytes, 1024);
     }
 }
 

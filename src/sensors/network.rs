@@ -79,7 +79,7 @@ pub enum EtherType {
 }
 
 #[derive(Clone)]
-struct Packet {
+pub struct Packet {
     datalink_type: i32,
     data: Vec<u8>,
     packet_type: Option<PacketType>,
@@ -385,9 +385,9 @@ pub struct NetworkInterface {
     pub name: String,
     pub total_received_bytes: u64,
     pub total_transmitted_bytes: u64,
-    ip_networks: Vec<IpNetwork>,
-    sockets: Vec<Socket>,
-    packets: Vec<Packet>,
+    pub ip_networks: Vec<IpNetwork>,
+    pub sockets: Vec<Socket>,
+    pub packets: Vec<Packet>,
 }
 
 impl Debug for NetworkInterface {
