@@ -198,6 +198,7 @@ async fn show_metrics(
                                 //MetricValueType::FloatDouble(value) => value.to_string(),
                                 MetricValueType::IntUnsigned(value) => value.to_string(),
                                 MetricValueType::Text(ref value) => value.to_string(),
+                                MetricValueType::Tuple(value) => format!("{} {}", value.0, value.1),
                             };
 
                             let mut should_i_add_help = true;

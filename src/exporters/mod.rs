@@ -72,6 +72,7 @@ enum MetricValueType {
     Text(String),
     //FloatDouble(f64),
     IntUnsigned(u64),
+    Tuple((u64, u64)),
 }
 
 impl fmt::Display for MetricValueType {
@@ -82,6 +83,7 @@ impl fmt::Display for MetricValueType {
             MetricValueType::Text(text) => write!(f, "{text}"),
             //MetricValueType::FloatDouble(value) => write!(f, "{value}"),
             MetricValueType::IntUnsigned(value) => write!(f, "{value}"),
+            MetricValueType::Tuple(value) => write!(f, "{} {}", value.0, value.1),
         }
     }
 }
@@ -94,6 +96,7 @@ impl fmt::Debug for MetricValueType {
             MetricValueType::Text(text) => write!(f, "{text}"),
             //MetricValueType::FloatDouble(value) => write!(f, "{value}"),
             MetricValueType::IntUnsigned(value) => write!(f, "{value}"),
+            MetricValueType::Tuple(value) => write!(f, "{} {}", value.0, value.1),
         }
     }
 }
@@ -443,8 +446,8 @@ impl MetricGenerator {
             .for_each(|net_interface| {
                 let mut attributes = HashMap::new();
                 attributes.insert(String::from("net_interface_name"), net_interface.name.clone());
-                let network_metric = Metric {
-                    name: String::from("scaph_net_interface_total_rx"),
+                let network_total_traffic_bytes = Metric {
+                    name: String::from("scaph_net_interface_total_traffic_bytes"),
                     metric_type: String::from("gauge"),
                     ttl: 60.0,
                     timestamp: default_timestamp,
@@ -453,9 +456,9 @@ impl MetricGenerator {
                     tags: vec![String::from("scaphandre")],
                     attributes: attributes.clone(),
                     description: String::from("Total received bytes for this network interface"),
-                    metric_value: MetricValueType::IntUnsigned(net_interface.total_received_bytes)
+                    metric_value: MetricValueType::Tuple((net_interface.total_received_bytes, net_interface.total_transmitted_bytes))
                 };
-                self.data.push(network_metric);
+                self.data.push(network_total_traffic_bytes);
             });
 
         #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
