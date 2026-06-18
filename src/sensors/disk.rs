@@ -104,6 +104,7 @@ impl std::fmt::Display for FormFactor {
 pub enum DiskError {
     NoBlockInSysfs,
     DiskAlreadyPresent,
+    NoSimilarDisk,
 }
 
 impl fmt::Display for DiskError {
@@ -114,6 +115,7 @@ impl fmt::Display for DiskError {
                 "No associated block directory has been found for this disk name in sysfs!"
             ),
             DiskError::DiskAlreadyPresent => write!(f, "Disk is already available in topology."),
+            DiskError::NoSimilarDisk => write!(f, "No similar disk can be found!"),
         }
     }
 }
@@ -219,45 +221,54 @@ impl EvaluatedDisk {
     }
 
     /// Returns the idle, write and read power consumption for a given disk.
-    pub fn find_power_specs(&self, power_model: &PowerModel) -> DiskRecord {
-        let mut similar_disks: Vec<&DiskRecord> = power_model
-            .disks
-            .iter()
-            .filter(|disk_pm| disk_pm.form_factor == self.form_factor && disk_pm.kind == self.kind)
-            .collect();
+    pub fn find_power_specs(&self, power_model: &PowerModel) -> Result<DiskRecord, DiskError> {
+        match self.form_factor {
+            FormFactor::NVME | FormFactor::SATA => {
+                let mut similar_disks: Vec<&DiskRecord> = power_model
+                    .disks
+                    .iter()
+                    .filter(|disk_pm| {
+                        disk_pm.form_factor == self.form_factor && disk_pm.kind == self.kind
+                    })
+                    .collect();
 
-        let similar_disks_by_capacity: Vec<&&DiskRecord> = similar_disks
-            .iter()
-            .filter(|disk_pm| disk_pm.capacity == self.capacity)
-            .collect();
+                let similar_disks_by_capacity: Vec<&&DiskRecord> = similar_disks
+                    .iter()
+                    .filter(|disk_pm| disk_pm.capacity == self.capacity)
+                    .collect();
 
-        match similar_disks_by_capacity.is_empty() {
-            false => {
-                let record = similar_disks_by_capacity[0];
-                DiskRecord {
-                    name: record.name.to_owned(),
-                    manufacturer: record.manufacturer.to_owned(),
-                    form_factor: record.form_factor,
-                    kind: record.kind,
-                    capacity: record.capacity,
-                    idle: record.idle,
-                    read: record.read,
-                    write: record.write,
-                    read_write: record.read_write,
+                match similar_disks_by_capacity.is_empty() {
+                    false => {
+                        let record = similar_disks_by_capacity[0];
+                        Ok(DiskRecord {
+                            name: record.name.to_owned(),
+                            manufacturer: record.manufacturer.to_owned(),
+                            form_factor: record.form_factor,
+                            kind: record.kind,
+                            capacity: record.capacity,
+                            idle: record.idle,
+                            read: record.read,
+                            write: record.write,
+                            read_write: record.read_write,
+                        })
+                    }
+                    true => {
+                        info!(
+                            "No similar disk by capacity identified, falling back on closest disk by capacity!"
+                        );
+                        similar_disks.sort_by(|a, b| a.capacity.cmp(&b.capacity));
+                        let length = similar_disks.len();
+                        let smallest_disk = similar_disks[0];
+                        let largest_disk = similar_disks[length - 1];
+                        if self.capacity < smallest_disk.capacity {
+                            Ok(smallest_disk.clone())
+                        } else {
+                            Ok(largest_disk.clone())
+                        }
+                    }
                 }
             }
-            true => {
-                info!("No similar disk by capacity identified, falling back on closest disk by capacity!");
-                similar_disks.sort_by(|a, b| a.capacity.cmp(&b.capacity));
-                let length = similar_disks.len();
-                let smallest_disk = similar_disks[0];
-                let largest_disk = similar_disks[length - 1];
-                if self.capacity < smallest_disk.capacity {
-                    smallest_disk.clone()
-                } else {
-                    largest_disk.clone()
-                }
-            }
+            FormFactor::Unknown => Err(DiskError::NoSimilarDisk),
         }
     }
 
@@ -265,23 +276,27 @@ impl EvaluatedDisk {
     /// The read and written bytes for a given Disk can be identified with sysinfo::Disk::usage.
     pub fn set_power_specs(&mut self, read_bytes: u64, written_bytes: u64) {
         if let Some(model) = &self.power_model {
-            let identified_record_for_disk = self.find_power_specs(model);
+            let identifying_record_for_disk = self.find_power_specs(model);
+            match identifying_record_for_disk {
+                Ok(record) => {
+                    let power_specs = DiskPowerSpecs {
+                        name: record.name,
+                        manufacturer: record.manufacturer,
+                        form_factor: record.form_factor,
+                        kind: record.kind,
+                        capacity: record.capacity,
+                        idle: record.idle,
+                        read: record.read,
+                        write: record.write,
+                        read_write: record.read_write,
+                        read_bytes,
+                        written_bytes,
+                    };
 
-            let power_specs = DiskPowerSpecs {
-                name: identified_record_for_disk.name,
-                manufacturer: identified_record_for_disk.manufacturer,
-                form_factor: identified_record_for_disk.form_factor,
-                kind: identified_record_for_disk.kind,
-                capacity: identified_record_for_disk.capacity,
-                idle: identified_record_for_disk.idle,
-                read: identified_record_for_disk.read,
-                write: identified_record_for_disk.write,
-                read_write: identified_record_for_disk.read_write,
-                read_bytes,
-                written_bytes,
-            };
-
-            self.power_specs = Some(power_specs);
+                    self.power_specs = Some(power_specs);
+                }
+                Err(e) => info!("{e}"),
+            }
         } else {
             info!("No power model yet set!")
         }
@@ -392,7 +407,9 @@ impl EvaluatedDisk {
             let new_record = self.generate_power_record();
             self.add_record(new_record.unwrap());
         } else {
-            info!("No previous power specification, continuing execution until specifications are found!");
+            info!(
+                "No previous power specification, continuing execution until specifications are found!"
+            );
         }
     }
 }
@@ -831,7 +848,7 @@ mod tests {
             disks: vec![first_disk_record.clone(), second_disk_record.clone()],
         };
 
-        let disk_power_consumption = disk.find_power_specs(&power_model);
+        let disk_power_consumption = disk.find_power_specs(&power_model).unwrap();
         assert_eq!(&disk_power_consumption.idle, &first_power_specs.idle);
         assert_eq!(&disk_power_consumption.write, &first_power_specs.write);
         assert_eq!(&disk_power_consumption.read, &first_power_specs.read);
@@ -936,8 +953,8 @@ mod tests {
     }
 
     #[test]
-    fn it_returns_an_error_if_an_attempt_to_read_a_disk_energy_record_without_enough_power_records_is_made(
-    ) {
+    fn it_returns_an_error_if_an_attempt_to_read_a_disk_energy_record_without_enough_power_records_is_made()
+     {
         let disk = generate_mock_evaluated_disk();
 
         let attempt_to_read_record = disk.read_record();
@@ -954,13 +971,13 @@ mod tests {
     }
 
     #[test]
-    fn it_should_find_the_closest_power_specs_for_a_disk_if_no_similar_capacity_was_identified_in_the_power_model(
-    ) {
+    fn it_should_find_the_closest_power_specs_for_a_disk_if_no_similar_capacity_was_identified_in_the_power_model()
+     {
         let mut disk = generate_mock_evaluated_disk();
         disk.capacity = 2048;
         let power_model = generate_power_model();
 
-        let power_specs = disk.find_power_specs(&power_model);
+        let power_specs = disk.find_power_specs(&power_model).unwrap();
 
         assert_eq!(power_specs.capacity, 1024);
         assert_eq!(power_specs.read, 3.0);
@@ -969,9 +986,20 @@ mod tests {
         let mut smaller_disk = generate_mock_evaluated_disk();
         smaller_disk.capacity = 256;
 
-        let power_specs = smaller_disk.find_power_specs(&power_model);
+        let power_specs = smaller_disk.find_power_specs(&power_model).unwrap();
         assert_eq!(power_specs.capacity, 512);
         assert_eq!(power_specs.read, 3.0);
         assert_eq!(power_specs.write, 5.0);
+    }
+
+    #[test]
+    fn it_should_return_a_non_panicking_error_if_no_similar_disks_by_form_factor_can_be_found() {
+        let mut disk = generate_mock_evaluated_disk();
+        disk.form_factor = FormFactor::Unknown;
+        let power_model = generate_power_model();
+
+        let try_finding_power_specs = disk.find_power_specs(&power_model).err();
+
+        assert_eq!(try_finding_power_specs, Some(DiskError::NoSimilarDisk));
     }
 }
