@@ -384,7 +384,7 @@ impl Socket {
 pub struct NetworkInterface {
     pub name: String,
     pub total_received_bytes: u64,
-    total_transmitted_bytes: u64,
+    pub total_transmitted_bytes: u64,
     ip_networks: Vec<IpNetwork>,
     sockets: Vec<Socket>,
     packets: Vec<Packet>,
@@ -418,6 +418,14 @@ impl NetworkInterface {
             }),
             _ => Err(NetworkError::UnconnectableDevice),
         }
+    }
+
+    pub fn refresh(&mut self, sysinfo_interface: (&String, &NetworkData)) {
+        let new_total_received = sysinfo_interface.1.total_received();
+        let new_total_transmitted = sysinfo_interface.1.total_transmitted();
+
+        self.total_received_bytes = new_total_received;
+        self.total_transmitted_bytes = new_total_transmitted;
     }
 
     fn identify_sockets(&mut self, sockets_file: &Path) {
@@ -892,6 +900,37 @@ mod tests {
                     Some(NetworkError::UnconnectableDevice)
                 );
             });
+        });
+    }
+
+    #[test]
+    fn it_should_refresh_the_total_received_and_transmitted_traffic_for_a_network_interface() {
+        let mut network_interfaces = sysinfo::Networks::new_with_refreshed_list();
+        let connection_status = ConnectionStatus::Connected;
+
+        let mut scaph_interfaces: Vec<NetworkInterface> = network_interfaces
+            .iter()
+            .map(|interface| NetworkInterface::new(interface, &connection_status).unwrap())
+            .collect();
+
+        network_interfaces.refresh(true);
+
+        scaph_interfaces.iter_mut().for_each(|scaph_interface| {
+            let matched_interface = network_interfaces
+                .iter()
+                .find(|sysinfo_interface| *sysinfo_interface.0 == scaph_interface.name)
+                .unwrap();
+
+            scaph_interface.refresh(matched_interface);
+
+            assert_eq!(
+                scaph_interface.total_received_bytes,
+                matched_interface.1.total_received()
+            );
+            assert_eq!(
+                scaph_interface.total_transmitted_bytes,
+                matched_interface.1.total_transmitted()
+            );
         });
     }
 

@@ -27,9 +27,7 @@ use utils::{IProcess, ProcessTracker, current_system_time_since_epoch};
 
 use crate::sensors::{
     disk::{Attributes, DiskMetrics, Metric, Metrics},
-    network::{
-        NetworkError, NetworkInterface,
-    },
+    network::{NetworkError, NetworkInterface},
 };
 
 // !!!!!!!!!!!!!!!!! Sensor !!!!!!!!!!!!!!!!!!!!!!!
@@ -380,6 +378,7 @@ impl Topology {
         self.refresh_procs();
         self.refresh_record();
         self.refresh_stats();
+        self.refresh_network_interfaces();
 
         #[cfg(all(target_os = "linux", feature = "disks_evaluation"))]
         {
@@ -779,7 +778,6 @@ impl Topology {
                 Ok(_) => info!("Added network interface to topology!"),
                 Err(e) => info!("{:?} {e}", sysinfo_interface.0),
             }
-
         });
 
         self.network_interfaces.clone()
@@ -809,6 +807,17 @@ impl Topology {
             }
             Err(_) => Err(NetworkError::UnconnectableDevice),
         }
+    }
+
+    pub fn refresh_network_interfaces(&mut self) {
+        let sysinfo_network_interfaces = sysinfo::Networks::new_with_refreshed_list();
+        self.network_interfaces.iter_mut().for_each(|interface| {
+            let matched_interface = sysinfo_network_interfaces
+                .iter()
+                .find(|sysinfo_interface| *sysinfo_interface.0 == interface.name)
+                .unwrap();
+            interface.refresh(matched_interface);
+        });
     }
 
     pub fn get_total_memory_bytes(&self) -> Record {
