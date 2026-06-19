@@ -445,7 +445,52 @@ impl MetricGenerator {
             .iter()
             .for_each(|net_interface| {
                 let mut attributes = HashMap::new();
-                attributes.insert(String::from("net_interface_name"), net_interface.name.clone());
+                attributes.insert(
+                    String::from("net_interface_name"),
+                    net_interface.name.clone(),
+                );
+
+                net_interface.sockets.iter().for_each(|socket| {
+                    let associated_interface = net_interface.name.clone();
+                    let source_addr = format!(
+                        "{}:{}",
+                        socket.source_ip.unwrap(),
+                        socket.source_port.unwrap()
+                    );
+                    let dest_addr = format!(
+                        "{}:{}",
+                        socket.destination_ip.unwrap(),
+                        socket.destination_port.unwrap()
+                    );
+
+                    let direction = socket.direction.clone().unwrap().to_string();
+
+                    let protocol = socket.protocol.clone().unwrap().to_string();
+
+                    let mut attributes = HashMap::new();
+
+                    attributes.insert(String::from("socket_net_interface"), associated_interface.to_string());
+                    attributes.insert(String::from("socket_source_address"), source_addr);
+                    attributes.insert(String::from("socket_destination_address"), dest_addr);
+                    attributes.insert(String::from("socket_protocol"), protocol);
+                    attributes.insert(String::from("socket_direction"), direction);
+
+                    let socket_metric = Metric {
+                        name: String::from("scaph_net_interface_socket"),
+                        metric_type: String::from("gauge"),
+                        ttl: 60.0,
+                        timestamp: default_timestamp,
+                        hostname: self.hostname.clone(),
+                        state: String::from("ok"),
+                        tags: vec![String::from("scaphandre")],
+                        attributes,
+                        description: String::from(
+                            "Source and destination addresses for this socket",
+                        ),
+                        metric_value: MetricValueType::IntUnsigned(0),
+                    };
+                    self.data.push(socket_metric);
+                });
                 let network_total_traffic_bytes = Metric {
                     name: String::from("scaph_net_interface_total_traffic_bytes"),
                     metric_type: String::from("gauge"),
@@ -456,7 +501,10 @@ impl MetricGenerator {
                     tags: vec![String::from("scaphandre")],
                     attributes: attributes.clone(),
                     description: String::from("Total received bytes for this network interface"),
-                    metric_value: MetricValueType::Tuple((net_interface.total_received_bytes, net_interface.total_transmitted_bytes))
+                    metric_value: MetricValueType::Tuple((
+                        net_interface.total_received_bytes,
+                        net_interface.total_transmitted_bytes,
+                    )),
                 };
                 self.data.push(network_total_traffic_bytes);
             });

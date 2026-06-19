@@ -148,16 +148,27 @@ struct EvaluatedDisk {
     timestamp: f64,
     consumption: u32,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+struct NetworkSocket {
+    source_address: String,
+    destination_address: String,
+    protocol: String,
+    direction: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct NetworkInterface {
     name: String,
     total_received_bytes: u64,
     total_transmitted_bytes: u64,
+    sockets: Vec<NetworkSocket>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Components {
     disks: Option<Vec<Disk>>,
+    network_interfaces: Option<Vec<NetworkInterface>>,
 }
 #[derive(Serialize, Deserialize)]
 struct Host {
@@ -370,6 +381,11 @@ impl JsonExporter {
             .filter(|metric| metric.name == "scaph_net_interface_total_traffic_bytes")
             .collect();
 
+        let sockets_metrics: Vec<&Metric> = metrics
+            .iter()
+            .filter(|metric| metric.name == "scaph_net_interface_socket")
+            .collect();
+
         let mut network_interfaces_metrics: Vec<NetworkInterface> = networks_metrics
             .iter()
             .map(|metric| {
@@ -378,6 +394,24 @@ impl JsonExporter {
                     .get("net_interface_name")
                     .unwrap()
                     .to_string();
+
+                let interface_sockets: Vec<NetworkSocket> = sockets_metrics
+                    .iter()
+                    .filter(|metric| {
+                        let interface_name = metric.attributes.get("socket_net_interface").unwrap();
+
+                        *interface_name == network_name
+                    })
+                    .map(|metric| NetworkSocket {
+                        source_address: metric.attributes.get("socket_source_address").unwrap().to_string(),
+                        destination_address: metric
+                            .attributes
+                            .get("socket_destination_address")
+                            .unwrap().to_string(),
+                        protocol: metric.attributes.get("socket_protocol").unwrap().to_string(),
+                        direction: metric.attributes.get("socket_direction").unwrap().to_string(),
+                    })
+                    .collect();
 
                 let total_traffic = match metric.metric_value {
                     MetricValueType::Tuple((total_rx, total_tx)) => Some((total_rx, total_tx)),
@@ -388,6 +422,7 @@ impl JsonExporter {
                     name: network_name,
                     total_received_bytes: total_traffic.unwrap().0,
                     total_transmitted_bytes: total_traffic.unwrap().1,
+                    sockets: interface_sockets,
                 }
             })
             .collect();
@@ -451,7 +486,10 @@ impl JsonExporter {
                 host_report = Some(Host {
                     consumption: host_power_f32,
                     timestamp: host_metric.timestamp.as_secs_f64(),
-                    components: Components { disks: None },
+                    components: Components {
+                        disks: None,
+                        network_interfaces: None,
+                    },
                 });
             }
         } else {
@@ -667,15 +705,19 @@ impl JsonExporter {
 
 #[cfg(all(target_os = "linux", feature = "disks_evaluation", test))]
 mod tests {
+
     use super::*;
     use crate::sensors::{
         Record, Sensor, Topology,
         disk::{DiskKindWrapper, DiskPowerSpecs, DiskState, EvaluatedDisk, FormFactor},
-        network::NetworkInterface,
+        network::{Direction, NetworkInterface, Protocol, Socket},
         units::Unit,
         utils::ProcessTracker,
     };
-    use std::error::Error;
+    use std::{
+        error::Error,
+        net::{IpAddr, Ipv4Addr},
+    };
 
     struct MockSensor;
     impl Sensor for MockSensor {
@@ -746,12 +788,26 @@ mod tests {
             power_model: None,
         };
 
+        let network_socket = Socket {
+            inode: 0,
+            process_name: Some(String::from("firefox")),
+            pid: Some(123),
+            protocol: Some(Protocol::Tcp),
+            source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            source_port: Some(22),
+            destination_port: Some(22),
+            direction: Some(Direction::Outgoing),
+            packets: vec![],
+            app_packets_size: Some(0),
+        };
+
         let first_network_interface = NetworkInterface {
             name: String::from("wlo1"),
             total_received_bytes: 1024,
             total_transmitted_bytes: 1024,
             ip_networks: vec![],
-            sockets: vec![],
+            sockets: vec![network_socket],
             packets: vec![],
         };
 
@@ -822,6 +878,18 @@ mod tests {
         assert_eq!(network_interfaces_reports[1].name, String::from("wlo2"));
         assert_eq!(network_interfaces_reports[0].total_received_bytes, 1024);
         assert_eq!(network_interfaces_reports[1].total_received_bytes, 1024);
+        assert_eq!(
+            network_interfaces_reports[0].sockets[0].source_address,
+            String::from("127.0.0.1:22")
+        );
+        assert_eq!(
+            network_interfaces_reports[0].sockets[0].protocol,
+            String::from("TCP")
+        );
+        assert_eq!(
+            network_interfaces_reports[0].sockets[0].direction,
+            String::from("Outgoing socket")
+        );
     }
 }
 

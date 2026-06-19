@@ -51,6 +51,16 @@ pub enum Protocol {
     Unknown,
 }
 
+impl Display for Protocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protocol::Tcp => write!(f, "TCP"),
+            Protocol::Udp => write!(f, "UDP"),
+            Protocol::Unknown => write!(f, "Unhandled protocol"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum IpVersion {
     Ipv4,
@@ -63,6 +73,16 @@ pub enum Direction {
     Outgoing,
     Incoming,
     Local,
+}
+
+impl Display for Direction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Direction::Outgoing => write!(f, "Outgoing socket"),
+            Direction::Incoming => write!(f, "Incoming socket"),
+            Direction::Local => write!(f, "Local socket"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -287,17 +307,17 @@ impl TransportLayerPacket {
 /// interface.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Socket {
-    inode: i32,
-    process_name: Option<String>,
-    pid: Option<u32>,
-    protocol: Option<Protocol>,
-    source_ip: Option<IpAddr>,
-    destination_ip: Option<IpAddr>,
-    source_port: Option<u32>,
-    destination_port: Option<u32>,
-    direction: Option<Direction>,
-    packets: Vec<TransportLayerPacket>,
-    app_packets_size: Option<u64>,
+    pub inode: i32,
+    pub process_name: Option<String>,
+    pub pid: Option<u32>,
+    pub protocol: Option<Protocol>,
+    pub source_ip: Option<IpAddr>,
+    pub destination_ip: Option<IpAddr>,
+    pub source_port: Option<u32>,
+    pub destination_port: Option<u32>,
+    pub direction: Option<Direction>,
+    pub packets: Vec<TransportLayerPacket>,
+    pub app_packets_size: Option<u64>,
 }
 
 impl Socket {
@@ -363,6 +383,15 @@ impl Socket {
         self.direction = Some(direction);
     }
 
+    fn set_protocol(&mut self, socket_path: &Path) {
+        let socket_file = socket_path.to_str().unwrap();
+        if socket_file.contains("tcp") {
+            self.protocol = Some(Protocol::Tcp);
+        } else if socket_file.contains("udp") {
+            self.protocol = Some(Protocol::Udp);
+        }
+    }
+
     fn evaluate_packets_size(&mut self) {
         let total_size = self
             .packets
@@ -408,14 +437,22 @@ impl NetworkInterface {
         connection_status: &ConnectionStatus,
     ) -> Result<Self, NetworkError> {
         match connection_status {
-            ConnectionStatus::Connected | ConnectionStatus::Disconnected => Ok(NetworkInterface {
-                name: sysinfo_interface.0.to_owned(),
-                total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
-                total_received_bytes: sysinfo_interface.1.total_received(),
-                ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
-                sockets: vec![],
-                packets: vec![],
-            }),
+            ConnectionStatus::Connected | ConnectionStatus::Disconnected => {
+                let sockets_paths = sockets_as_paths();
+
+                let mut net_interface = NetworkInterface {
+                    name: sysinfo_interface.0.to_owned(),
+                    total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
+                    total_received_bytes: sysinfo_interface.1.total_received(),
+                    ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
+                    sockets: vec![],
+                    packets: vec![],
+                };
+
+                net_interface.set_sockets(&sockets_paths);
+
+                Ok(net_interface)
+            }
             _ => Err(NetworkError::UnconnectableDevice),
         }
     }
@@ -470,17 +507,26 @@ impl NetworkInterface {
                     .parse::<i32>()
                     .expect("It should parse the socket inode.");
 
-                Socket::new(
+                let mut socket = Socket::new(
                     inode,
                     source_ip,
                     destination_ip,
                     source_port,
                     destination_port,
-                )
+                );
+                socket.set_protocol(sockets_file);
+                socket.set_direction(&local_ips);
+                socket
             })
             .collect();
 
         sockets.iter().for_each(|s| self.sockets.push(s.clone()));
+    }
+
+    pub fn set_sockets(&mut self, sockets_paths: &[PathBuf]) {
+        sockets_paths.iter().for_each(|path| {
+            self.identify_sockets(path);
+        });
     }
 
     pub fn capture_packet(&mut self, mut capture: Capture<Active>) {
@@ -685,6 +731,20 @@ fn get_direction(source_ip: &IpAddr, direction_ip: &IpAddr, local_ips: &[IpAddr]
     }
 }
 
+fn sockets_as_paths() -> Vec<PathBuf> {
+    let sockets_file_names = [
+        TCP_SOCKETS_FILE,
+        TCP6_SOCKETS_FILE,
+        UDP_SOCKETS_FILE,
+        UDP6_SOCKETS_FILE,
+    ];
+
+    sockets_file_names
+        .iter()
+        .map(|socket_file_name| Path::new(socket_file_name).to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,7 +887,7 @@ mod tests {
             inode: 123,
             process_name: Some(String::from("firefox")),
             pid: Some(123),
-            protocol: Some(Protocol::Tcp),
+            protocol: None,
             source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             source_port: Some(123),
@@ -862,6 +922,13 @@ mod tests {
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
         }
+    }
+
+    #[test]
+    fn it_should_get_all_sockets_files_as_paths() {
+        let paths = sockets_as_paths();
+
+        assert_eq!(paths.len(), 4);
     }
 
     #[test]
@@ -932,6 +999,41 @@ mod tests {
                 matched_interface.1.total_transmitted()
             );
         });
+    }
+
+    #[test]
+    fn it_should_identify_all_sockets_attached_to_a_network_interface() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let tcp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/tcp");
+        let tcp_path = tcp_sockets_fixture.as_path().to_owned();
+
+        let udp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/udp");
+        let udp_path = udp_sockets_fixture.as_path().to_owned();
+
+        let paths = vec![udp_path, tcp_path];
+
+        let first_ip_network = IpNetwork {
+            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            prefix: 24,
+        };
+
+        let second_ip_network = IpNetwork {
+            addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            prefix: 24,
+        };
+
+        let mut net_interface = NetworkInterface {
+            name: String::from("wlo1"),
+            ip_networks: vec![first_ip_network, second_ip_network],
+            sockets: vec![],
+            packets: vec![],
+            total_transmitted_bytes: 0,
+            total_received_bytes: 0,
+        };
+
+        net_interface.set_sockets(&paths);
+
+        assert!(!net_interface.sockets.is_empty())
     }
 
     #[test]
@@ -1282,6 +1384,26 @@ mod tests {
         socket.set_direction(&local_ips);
 
         assert_eq!(socket.direction.unwrap(), Direction::Local);
+    }
+
+    #[test]
+    fn it_should_identify_the_protocol_for_a_socket() {
+        let socket_paths = sockets_as_paths();
+
+        let mut socket = outgoing_socket();
+        socket_paths.iter().for_each(|path| {
+            socket.set_protocol(path);
+
+            let string_path = path.to_str().unwrap();
+
+            let protocol = socket.protocol.clone().unwrap();
+
+            if string_path.contains("tcp") {
+                assert_eq!(protocol, Protocol::Tcp);
+            } else {
+                assert_eq!(protocol, Protocol::Udp);
+            }
+        });
     }
 
     #[test]
