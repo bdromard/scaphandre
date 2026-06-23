@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pcap::{Active, Capture, ConnectionStatus};
+use pcap::{Active, Address, Capture, ConnectionStatus, Device};
 use sysinfo::{IpNetwork, NetworkData};
 
 const TCP_SOCKETS_FILE: &str = "/proc/net/tcp";
@@ -17,6 +17,7 @@ const UDP6_SOCKETS_FILE: &str = "/proc/net/udp6";
 pub enum NetworkError {
     UnconnectableDevice,
     NetworkInterfaceAlreadyPresent,
+    InvalidIp,
 }
 
 impl Display for NetworkError {
@@ -27,6 +28,9 @@ impl Display for NetworkError {
             }
             NetworkError::NetworkInterfaceAlreadyPresent => {
                 write!(f, "Network interface is already present in topology.")
+            }
+            NetworkError::InvalidIp => {
+                write!(f, "Not a valid IP address for a connectable device!")
             }
         }
     }
@@ -440,20 +444,53 @@ impl NetworkInterface {
             ConnectionStatus::Connected | ConnectionStatus::Disconnected => {
                 let sockets_paths = sockets_as_paths();
 
-                let mut net_interface = NetworkInterface {
-                    name: sysinfo_interface.0.to_owned(),
-                    total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
-                    total_received_bytes: sysinfo_interface.1.total_received(),
-                    ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
-                    sockets: vec![],
-                    packets: vec![],
-                };
+                let mut scaph_net_interface = Self::generate_network_interface(sysinfo_interface);
+                scaph_net_interface.set_sockets(&sockets_paths);
 
-                net_interface.set_sockets(&sockets_paths);
-
-                Ok(net_interface)
+                Ok(scaph_net_interface)
             }
-            _ => Err(NetworkError::UnconnectableDevice),
+            // The NotApplicable connection status can exclude some valid connectable devices.
+            // Checking the IP addresses for a device to see if it can be a valid connectable
+            // device.
+            ConnectionStatus::NotApplicable => {
+                let devices = Device::list().unwrap();
+                let matched_device = devices
+                    .iter()
+                    .find(|dev| dev.name == *sysinfo_interface.0)
+                    .unwrap();
+
+                let valid_addresses: Vec<IpAddr> = matched_device
+                    .addresses
+                    .iter()
+                    .filter_map(|addr| {
+                        let valid_ip = filter_ip(addr.addr).map_err(|e| warn!("{e}"));
+                        valid_ip.ok()
+                    })
+                    .collect();
+
+                if valid_addresses.is_empty() {
+                    Err(NetworkError::UnconnectableDevice)
+                } else {
+                    let sockets_paths = sockets_as_paths();
+                    let mut scaph_net_interface =
+                        Self::generate_network_interface(sysinfo_interface);
+                    scaph_net_interface.set_sockets(&sockets_paths);
+
+                    Ok(scaph_net_interface)
+                }
+            }
+            ConnectionStatus::Unknown => Err(NetworkError::UnconnectableDevice),
+        }
+    }
+
+    fn generate_network_interface(sysinfo_interface: (&String, &NetworkData)) -> Self {
+        NetworkInterface {
+            name: sysinfo_interface.0.to_owned(),
+            total_transmitted_bytes: sysinfo_interface.1.total_transmitted(),
+            total_received_bytes: sysinfo_interface.1.total_received(),
+            ip_networks: sysinfo_interface.1.ip_networks().to_vec(),
+            sockets: vec![],
+            packets: vec![],
         }
     }
 
@@ -718,6 +755,29 @@ fn identify_app_packet_size(data: &[u8], protocol: Protocol) -> u32 {
     size.unwrap()
 }
 
+fn filter_ip(address: IpAddr) -> Result<IpAddr, NetworkError> {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            if !v4.is_link_local() && !v4.is_loopback() && !v4.is_broadcast() {
+                Ok(std::net::IpAddr::V4(v4))
+            } else {
+                Err(NetworkError::InvalidIp)
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if !v6.is_loopback()
+                && !v6.is_multicast()
+                && !v6.is_unique_local()
+                && !v6.is_unicast_link_local()
+            {
+                Ok(std::net::IpAddr::V6(v6))
+            } else {
+                Err(NetworkError::InvalidIp)
+            }
+        }
+    }
+}
+
 /// Identifying the traffic direction, in order to allocate the relevant traffic throughput to a
 /// process receiving or transmitting bytes. Some applications can use TCP / UDP sockets for local
 /// traffic. These local sockets should be ignored at the moment.
@@ -953,10 +1013,10 @@ mod tests {
     }
 
     #[test]
-    fn it_should_not_create_a_net_network_interface_is_the_identified_device_is_not_connectable() {
+    fn it_should_not_create_a_network_interface_is_the_identified_device_is_unknown() {
         let network_interfaces = sysinfo::Networks::new_with_refreshed_list();
 
-        let connection_statuses = [ConnectionStatus::Unknown, ConnectionStatus::NotApplicable];
+        let connection_statuses = [ConnectionStatus::Unknown];
 
         connection_statuses.iter().for_each(|status| {
             network_interfaces.iter().for_each(|interface| {
@@ -967,6 +1027,38 @@ mod tests {
                     Some(NetworkError::UnconnectableDevice)
                 );
             });
+        });
+    }
+
+    #[test]
+    fn it_should_create_a_network_interface_after_verifying_that_it_is_a_connectable_device() {
+        let network_interfaces = sysinfo::Networks::new_with_refreshed_list();
+
+        let devices = pcap::Device::list().unwrap();
+
+        devices.iter().for_each(|dev| {
+            let matched_interface = network_interfaces
+                .iter()
+                .find(|interface| *interface.0 == dev.name);
+
+            let adresses: Vec<IpAddr> = dev
+                .addresses
+                .iter()
+                .filter_map(|addr| {
+                    let address = addr.addr;
+
+                    let valid_ip = filter_ip(address)
+                        .map_err(|e| eprintln!("Failed to get valid IP address: {}", e));
+                    valid_ip.ok()
+                })
+                .collect();
+
+            if !adresses.is_empty() {
+                let trying_scaph_net_interface =
+                    NetworkInterface::new(matched_interface.unwrap(), &dev.flags.connection_status);
+
+                assert!(trying_scaph_net_interface.is_ok());
+            }
         });
     }
 
