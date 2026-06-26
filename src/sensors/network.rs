@@ -348,8 +348,8 @@ impl Socket {
     }
 
     /// A socket must have a unique process to which it is associated.
-    fn identify_process(&mut self, processes: Vec<&ProcessNetworkMetrics>) {
-        let process: Vec<&&ProcessNetworkMetrics> = processes
+    pub fn identify_process(&mut self, processes: &[ProcessNetworkMetrics]) {
+        let process: Vec<&ProcessNetworkMetrics> = processes
             .iter()
             .filter(|process| {
                 process
@@ -439,13 +439,14 @@ impl NetworkInterface {
     pub fn new(
         sysinfo_interface: (&String, &NetworkData),
         connection_status: &ConnectionStatus,
+        processes: &Vec<ProcessNetworkMetrics>,
     ) -> Result<Self, NetworkError> {
         match connection_status {
             ConnectionStatus::Connected | ConnectionStatus::Disconnected => {
                 let sockets_paths = sockets_as_paths();
 
                 let mut scaph_net_interface = Self::generate_network_interface(sysinfo_interface);
-                scaph_net_interface.set_sockets(&sockets_paths);
+                scaph_net_interface.set_sockets(&sockets_paths, processes);
 
                 Ok(scaph_net_interface)
             }
@@ -474,7 +475,7 @@ impl NetworkInterface {
                     let sockets_paths = sockets_as_paths();
                     let mut scaph_net_interface =
                         Self::generate_network_interface(sysinfo_interface);
-                    scaph_net_interface.set_sockets(&sockets_paths);
+                    scaph_net_interface.set_sockets(&sockets_paths, &processes);
 
                     Ok(scaph_net_interface)
                 }
@@ -502,7 +503,7 @@ impl NetworkInterface {
         self.total_transmitted_bytes = new_total_transmitted;
     }
 
-    fn identify_sockets(&mut self, sockets_file: &Path) {
+    fn identify_sockets(&mut self, sockets_file: &Path, processes: &Vec<ProcessNetworkMetrics>) {
         let local_ips: Vec<IpAddr> = self
             .ip_networks
             .iter()
@@ -553,6 +554,7 @@ impl NetworkInterface {
                 );
                 socket.set_protocol(sockets_file);
                 socket.set_direction(&local_ips);
+                socket.identify_process(processes);
                 socket
             })
             .collect();
@@ -560,9 +562,13 @@ impl NetworkInterface {
         sockets.iter().for_each(|s| self.sockets.push(s.clone()));
     }
 
-    pub fn set_sockets(&mut self, sockets_paths: &[PathBuf]) {
+    pub fn set_sockets(
+        &mut self,
+        sockets_paths: &[PathBuf],
+        processes: &Vec<ProcessNetworkMetrics>,
+    ) {
         sockets_paths.iter().for_each(|path| {
-            self.identify_sockets(path);
+            self.identify_sockets(path, processes);
         });
     }
 
@@ -590,14 +596,18 @@ pub struct ProcessNetworkMetrics {
 }
 
 impl ProcessNetworkMetrics {
-    pub fn new(name: &str, pid: &Pid) -> Self {
-        ProcessNetworkMetrics {
+    pub fn new(name: &str, pid: &Pid, proc_path: &Path) -> Self {
+
+        let mut process = ProcessNetworkMetrics {
             name: name.to_string(),
             pid: *pid,
             sockets_inodes: None,
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
-        }
+        };
+
+        process.identify_psock_inodes(proc_path);
+        process
     }
 
     /// Each process can be associated to several sockets. For each process, inodes in
@@ -605,40 +615,47 @@ impl ProcessNetworkMetrics {
     pub fn identify_psock_inodes(&mut self, proc_path: &Path) {
         let fd_path = proc_path.join("proc").join(self.pid.to_string()).join("fd");
 
-        let slinks: Vec<String> = fd_path
-            .read_dir()
-            .unwrap()
-            .filter(|entry| {
-                let path = entry.as_ref().unwrap().path();
-                path.is_symlink()
-            })
-            .map(|entry| {
-                let link = entry.unwrap().path().read_link().unwrap();
-                link.to_str().unwrap().to_string()
-            })
-            .collect();
+        let maybe_dir = fd_path.read_dir();
 
-        let sockets: Vec<String> = slinks
-            .iter()
-            .filter(|link| link.starts_with("socket"))
-            .map(|socket| socket.to_string())
-            .collect();
+        match maybe_dir {
+            Ok(dir) => {
+                let slinks: Vec<String> = dir
+                    .filter(|entry| {
+                        let path = entry.as_ref().unwrap().path();
+                        path.is_symlink()
+                    })
+                    .map(|entry| {
+                        let link = entry.unwrap().path().read_link().unwrap();
+                        link.to_str().unwrap().to_string()
+                    })
+                    .collect();
 
-        let mut inodes: Vec<i32> = sockets
-            .iter()
-            .map(|socket| {
-                socket
-                    .strip_prefix("socket:[")
-                    .unwrap()
-                    .strip_suffix("]")
-                    .unwrap()
-                    .parse::<i32>()
-                    .unwrap()
-            })
-            .collect();
+                let sockets: Vec<String> = slinks
+                    .iter()
+                    .filter(|link| link.starts_with("socket"))
+                    .map(|socket| socket.to_string())
+                    .collect();
 
-        inodes.sort();
-        self.sockets_inodes = Some(inodes);
+                let mut inodes: Vec<i32> = sockets
+                    .iter()
+                    .map(|socket| {
+                        socket
+                            .strip_prefix("socket:[")
+                            .unwrap()
+                            .strip_suffix("]")
+                            .unwrap()
+                            .parse::<i32>()
+                            .unwrap()
+                    })
+                    .collect();
+
+                inodes.sort();
+                self.sockets_inodes = Some(inodes);
+            }
+            Err(e) => {
+                self.sockets_inodes = Some(vec![]);
+                warn!("Directory not found! {e}");},
+        }
     }
 
     pub fn update_traffic(&mut self, sockets: &[Socket]) {
@@ -665,26 +682,6 @@ impl ProcessNetworkMetrics {
         self.total_received_bytes += total_received_traffic;
         self.total_transmitted_bytes += total_transmitted_traffic;
     }
-}
-
-fn find_inodes_for_sockets(sockets_file: PathBuf) -> Vec<i32> {
-    let sockets: Vec<String> = read_to_string(sockets_file)
-        .unwrap()
-        .lines()
-        .map(|line| line.to_string())
-        .collect();
-
-    // Ignoring header in /proc/net/tcp{6} or /proc/net/udp{6} file
-    let inodes: Vec<i32> = sockets[1..]
-        .iter()
-        .map(|socket| {
-            socket.trim().split(" ").collect::<Vec<&str>>()[20]
-                .parse::<i32>()
-                .unwrap()
-        })
-        .collect();
-
-    inodes
 }
 
 fn parse_address_from_hex(hex_string: &str) -> Result<IpAddr, ParsingError> {
@@ -978,11 +975,15 @@ mod tests {
     fn process() -> ProcessNetworkMetrics {
         ProcessNetworkMetrics {
             name: String::from("firefox"),
-            pid: 123,
-            sockets_inodes: Some(vec![37312, 37313]),
+            pid: Pid::from_u32(123),
+            sockets_inodes: Some(vec![37312, 37313, 16344]),
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
         }
+    }
+
+    fn processes() -> Vec<ProcessNetworkMetrics> {
+        vec![process(), process()]
     }
 
     #[test]
@@ -998,7 +999,8 @@ mod tests {
         let connection_status = ConnectionStatus::Connected;
 
         network_interfaces.iter().for_each(|interface| {
-            let scaph_net_interface = NetworkInterface::new(interface, &connection_status).unwrap();
+            let scaph_net_interface =
+                NetworkInterface::new(interface, &connection_status, &processes()).unwrap();
 
             assert_eq!(&scaph_net_interface.name, interface.0);
             assert_eq!(
@@ -1022,7 +1024,7 @@ mod tests {
         connection_statuses.iter().for_each(|status| {
             network_interfaces.iter().for_each(|interface| {
                 let try_creating_scaph_net_interface =
-                    NetworkInterface::new(interface, status).err();
+                    NetworkInterface::new(interface, status, &processes()).err();
                 assert_eq!(
                     try_creating_scaph_net_interface,
                     Some(NetworkError::UnconnectableDevice)
@@ -1055,8 +1057,11 @@ mod tests {
                 .collect();
 
             if !adresses.is_empty() {
-                let trying_scaph_net_interface =
-                    NetworkInterface::new(matched_interface.unwrap(), &dev.flags.connection_status);
+                let trying_scaph_net_interface = NetworkInterface::new(
+                    matched_interface.unwrap(),
+                    &dev.flags.connection_status,
+                    &processes(),
+                );
 
                 assert!(trying_scaph_net_interface.is_ok());
             }
@@ -1070,7 +1075,9 @@ mod tests {
 
         let mut scaph_interfaces: Vec<NetworkInterface> = network_interfaces
             .iter()
-            .map(|interface| NetworkInterface::new(interface, &connection_status).unwrap())
+            .map(|interface| {
+                NetworkInterface::new(interface, &connection_status, &processes()).unwrap()
+            })
             .collect();
 
         network_interfaces.refresh(true);
@@ -1124,7 +1131,7 @@ mod tests {
             total_received_bytes: 0,
         };
 
-        net_interface.set_sockets(&paths);
+        net_interface.set_sockets(&paths, &processes());
 
         assert!(!net_interface.sockets.is_empty())
     }
@@ -1180,7 +1187,7 @@ mod tests {
             packets: vec![],
         };
 
-        network_interface.identify_sockets(path);
+        network_interface.identify_sockets(path, &processes());
 
         let expected_destination_ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 

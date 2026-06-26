@@ -19,7 +19,9 @@ pub mod utils;
 use pcap::{ConnectionStatus, Device};
 #[cfg(target_os = "linux")]
 use procfs::{CpuInfo, CpuTime, KernelStats};
-use std::{collections::HashMap, error::Error, fmt, fs, mem::size_of_val, str, time::Duration};
+use std::{
+    collections::HashMap, error::Error, fmt, fs, mem::size_of_val, path::Path, str, time::Duration,
+};
 #[allow(unused_imports)]
 use sysinfo::{DiskKind, Pid, System};
 use sysinfo::{NetworkData, Networks};
@@ -27,7 +29,7 @@ use utils::{IProcess, ProcessTracker, current_system_time_since_epoch};
 
 use crate::sensors::{
     disk::{Attributes, DiskMetrics, Metric, Metrics},
-    network::{NetworkError, NetworkInterface},
+    network::{NetworkError, NetworkInterface, ProcessNetworkMetrics},
 };
 
 // !!!!!!!!!!!!!!!!! Sensor !!!!!!!!!!!!!!!!!!!!!!!
@@ -788,8 +790,31 @@ impl Topology {
         sysinfo_interface: (&String, &NetworkData),
         connection_status: &ConnectionStatus,
     ) -> Result<(), NetworkError> {
-        let possible_scaph_net_interface =
-            NetworkInterface::new(sysinfo_interface, connection_status);
+        let pids = &self.proc_tracker.get_all_pids();
+
+        let pids_and_names: Vec<(&Pid, String)> = pids
+            .iter()
+            .map(|pid| {
+                let process_name = self.proc_tracker.get_process_name(*pid);
+
+                (pid, process_name)
+            })
+            .collect();
+
+        let root_path = Path::new("/");
+
+        let processes_network_metrics: Vec<ProcessNetworkMetrics> = pids_and_names
+            .iter()
+            .map(|pid_and_name| {
+                ProcessNetworkMetrics::new(pid_and_name.1.as_str(), pid_and_name.0, root_path)
+            })
+            .collect();
+
+        let possible_scaph_net_interface = NetworkInterface::new(
+            sysinfo_interface,
+            connection_status,
+            &processes_network_metrics,
+        );
 
         match possible_scaph_net_interface {
             Ok(interface_to_add) => {
