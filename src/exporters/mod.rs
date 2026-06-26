@@ -463,17 +463,31 @@ impl MetricGenerator {
                         socket.destination_port.unwrap()
                     );
 
+                    let pid = match socket.pid {
+                        Some(pid) => pid.to_string(),
+                        None => String::from(""),
+                    };
+                    let process_name = match &socket.process_name {
+                        Some(name) => name.to_string(),
+                        None => String::from("")
+                    };
+
                     let direction = socket.direction.clone().unwrap().to_string();
 
                     let protocol = socket.protocol.clone().unwrap().to_string();
 
                     let mut attributes = HashMap::new();
 
-                    attributes.insert(String::from("socket_net_interface"), associated_interface.to_string());
+                    attributes.insert(
+                        String::from("socket_net_interface"),
+                        associated_interface.to_string(),
+                    );
                     attributes.insert(String::from("socket_source_address"), source_addr);
                     attributes.insert(String::from("socket_destination_address"), dest_addr);
                     attributes.insert(String::from("socket_protocol"), protocol);
                     attributes.insert(String::from("socket_direction"), direction);
+                    attributes.insert(String::from("socket_process_name"), process_name);
+                    attributes.insert(String::from("socket_process_pid"), pid);
 
                     let socket_metric = Metric {
                         name: String::from("scaph_net_interface_socket"),

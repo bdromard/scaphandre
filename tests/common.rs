@@ -138,6 +138,7 @@ pub fn generate_mock_topology(disks: bool) -> Topology {
             _sensor_data: mock_sensor_data,
             proc_tracker,
             disks: vec![],
+            network_interfaces: vec![],
         };
 
         return mock_topology;
@@ -179,6 +180,7 @@ pub fn generate_mock_topology(disks: bool) -> Topology {
             _sensor_data: mock_sensor_data,
             proc_tracker,
             disks: vec![disk.clone(), disk.clone()],
+            network_interfaces: vec![],
         }
     }
 }

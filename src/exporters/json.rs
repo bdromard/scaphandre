@@ -155,6 +155,8 @@ struct NetworkSocket {
     destination_address: String,
     protocol: String,
     direction: String,
+    process_name: String,
+    process_pid: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -410,6 +412,8 @@ impl JsonExporter {
                             .unwrap().to_string(),
                         protocol: metric.attributes.get("socket_protocol").unwrap().to_string(),
                         direction: metric.attributes.get("socket_direction").unwrap().to_string(),
+                        process_pid: metric.attributes.get("socket_process_pid").unwrap().to_string(),
+                        process_name: metric.attributes.get("socket_process_name").unwrap().to_string(),
                     })
                     .collect();
 
@@ -891,6 +895,14 @@ mod tests {
         assert_eq!(
             network_interfaces_reports[0].sockets[0].direction,
             String::from("Outgoing socket")
+        );
+        assert_eq!(
+            network_interfaces_reports[0].sockets[0].process_name,
+            String::from("firefox")
+        );
+        assert_eq!(
+            network_interfaces_reports[0].sockets[0].process_pid,
+            String::from("123")
         );
     }
 }
