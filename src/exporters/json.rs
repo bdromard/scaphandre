@@ -706,6 +706,8 @@ impl JsonExporter {
 #[cfg(all(target_os = "linux", feature = "disks_evaluation", test))]
 mod tests {
 
+    use sysinfo::Pid;
+
     use super::*;
     use crate::sensors::{
         Record, Sensor, Topology,
@@ -791,7 +793,7 @@ mod tests {
         let network_socket = Socket {
             inode: 0,
             process_name: Some(String::from("firefox")),
-            pid: Some(123),
+            pid: Some(Pid::from_u32(123)),
             protocol: Some(Protocol::Tcp),
             source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),

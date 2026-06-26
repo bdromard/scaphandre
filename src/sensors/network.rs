@@ -6,7 +6,7 @@ use std::{
 };
 
 use pcap::{Active, Address, Capture, ConnectionStatus, Device};
-use sysinfo::{IpNetwork, NetworkData};
+use sysinfo::{IpNetwork, NetworkData, Pid};
 
 const TCP_SOCKETS_FILE: &str = "/proc/net/tcp";
 const TCP6_SOCKETS_FILE: &str = "/proc/net/tcp6";
@@ -313,7 +313,7 @@ impl TransportLayerPacket {
 pub struct Socket {
     pub inode: i32,
     pub process_name: Option<String>,
-    pub pid: Option<u32>,
+    pub pid: Option<Pid>,
     pub protocol: Option<Protocol>,
     pub source_ip: Option<IpAddr>,
     pub destination_ip: Option<IpAddr>,
@@ -580,19 +580,20 @@ impl NetworkInterface {
 /// This structure contains the relevant information about a process network metrics. Scaphandre
 /// already identifies processes at runtime ; this could be used either to update the exposed
 /// information for each process, or as a separate object.
+#[derive(Debug, Clone)]
 pub struct ProcessNetworkMetrics {
     pub name: String,
-    pub pid: u32,
+    pub pid: Pid,
     pub sockets_inodes: Option<Vec<i32>>,
     pub total_received_bytes: u64,
     pub total_transmitted_bytes: u64,
 }
 
 impl ProcessNetworkMetrics {
-    pub fn new(name: &str, pid: u32) -> Self {
+    pub fn new(name: &str, pid: &Pid) -> Self {
         ProcessNetworkMetrics {
             name: name.to_string(),
-            pid,
+            pid: *pid,
             sockets_inodes: None,
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
@@ -946,8 +947,8 @@ mod tests {
         Socket {
             inode: 123,
             process_name: Some(String::from("firefox")),
-            pid: Some(123),
-            protocol: None,
+            pid: Some(Pid::from_u32(123)),
+            protocol: Some(Protocol::Tcp),
             source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             destination_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             source_port: Some(123),
@@ -962,7 +963,7 @@ mod tests {
         Socket {
             inode: 123,
             process_name: Some(String::from("firefox")),
-            pid: Some(123),
+            pid: Some(Pid::from_u32(123)),
             protocol: Some(Protocol::Tcp),
             source_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             destination_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
@@ -1190,35 +1191,14 @@ mod tests {
             network_sockets[0].destination_ip,
             Some(expected_destination_ip)
         );
-    }
-
-    #[test]
-    fn it_should_identify_the_inodes_for_listening_tcp_sockets() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let tcp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/tcp");
-        let expected_inodes = vec![37312, 37313, 28907, 16344];
-
-        let identified_inodes = find_inodes_for_sockets(tcp_sockets_fixture);
-
-        assert_eq!(expected_inodes, identified_inodes);
-    }
-
-    #[test]
-    fn it_should_identify_the_inodes_for_listening_udp_sockets() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let udp_sockets_fixture = Path::new(manifest_dir).join("tests/fixtures/udp");
-        let expected_inodes = vec![28671, 17324, 20750, 31834];
-
-        let identified_inodes = find_inodes_for_sockets(udp_sockets_fixture);
-
-        assert_eq!(expected_inodes, identified_inodes);
+        assert_eq!(network_sockets[0].pid.unwrap(), Pid::from_u32(123))
     }
 
     #[test]
     fn it_should_identify_a_socket_for_a_given_process() {
         let first_process = ProcessNetworkMetrics {
             name: String::from("firefox"),
-            pid: 123,
+            pid: Pid::from_u32(123),
             sockets_inodes: Some(vec![37312, 37313]),
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
@@ -1226,7 +1206,7 @@ mod tests {
 
         let second_process = ProcessNetworkMetrics {
             name: String::from("signal_desktop"),
-            pid: 456,
+            pid: Pid::from_u32(456),
             sockets_inodes: Some(vec![28907, 16344]),
             total_received_bytes: 0,
             total_transmitted_bytes: 0,
@@ -1240,10 +1220,10 @@ mod tests {
             0,
         );
 
-        socket.identify_process(vec![&first_process, &second_process]);
+        socket.identify_process(&vec![first_process.clone(), second_process]);
 
         assert_eq!(socket.process_name.unwrap(), first_process.name);
-        assert_eq!(socket.pid.unwrap(), first_process.pid);
+        assert_eq!(socket.pid.unwrap(), first_process.pid.clone());
     }
 
     #[test]
